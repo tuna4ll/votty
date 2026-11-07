@@ -9,10 +9,11 @@ debug:
 
 check:
 	$(ODIN) check . -vet -strict-style
+	$(ODIN) check term -no-entry-point -vet -strict-style
 
 # test sources live outside the repository
 test:
-	$(ODIN) test $(TESTS) -collection:votty=. -vet
+	$(ODIN) test $(TESTS) -collection:votty=. -vet -define:ODIN_TEST_THREADS=1
 
 clean:
 	rm -f votty votty-debug
