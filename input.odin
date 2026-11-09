@@ -1,5 +1,6 @@
 package main
 
+import "core:strings"
 import "term"
 import "vendor:glfw"
 
@@ -141,23 +142,197 @@ install_callbacks :: proc(app: ^App) {
 	glfw.SetFramebufferSizeCallback(app.win, on_resize)
 	glfw.SetWindowContentScaleCallback(app.win, on_scale)
 	glfw.SetWindowRefreshCallback(app.win, on_refresh)
+	glfw.SetMouseButtonCallback(app.win, on_mouse_button)
+	glfw.SetCursorPosCallback(app.win, on_cursor_pos)
+	glfw.SetScrollCallback(app.win, on_scroll)
+	glfw.SetWindowFocusCallback(app.win, on_focus)
 }
 
 handle_shortcut :: proc(app: ^App, key: i32, m: term.Mods) -> bool {
+	p := app.pane
+	if m == {.Shift} && p != nil && p.vt.scr == &p.vt.primary {
+		t := p.vt
+		switch key {
+		case glfw.KEY_PAGE_UP:
+			term.scroll_view(t, t.rows - 1)
+		case glfw.KEY_PAGE_DOWN:
+			term.scroll_view(t, -(t.rows - 1))
+		case glfw.KEY_HOME:
+			term.scroll_view(t, t.hist.count)
+		case glfw.KEY_END:
+			term.scroll_view(t, -t.view)
+		case:
+			return false
+		}
+		app.dirty = true
+		return true
+	}
 	if m != {.Ctrl, .Shift} do return false
 	switch key {
+	case glfw.KEY_C:
+		if p != nil do copy_selection(app, p)
 	case glfw.KEY_EQUAL:
 		set_font_size(app, app.f.size + 1)
 	case glfw.KEY_MINUS:
 		set_font_size(app, app.f.size - 1)
 	case glfw.KEY_V:
-		if s := glfw.GetClipboardString(app.win); s != "" && app.pane != nil {
-			out := make([dynamic]u8, context.temp_allocator)
-			term.encode_paste(app.pane.vt, s, &out)
-			pane_input(app, app.pane, out[:])
-		}
+		if p != nil do paste(app, p)
 	case:
 		return false
 	}
 	return true
+}
+
+// cell under the mouse, clamped to the pane grid
+mouse_cell :: proc(app: ^App, p: ^Pane) -> (col, row: int) {
+	mx, my := glfw.GetCursorPos(app.win)
+	ww, _ := glfw.GetWindowSize(app.win)
+	fw, _ := glfw.GetFramebufferSize(app.win)
+	k := f64(fw) / f64(max(ww, 1))
+	col = int((mx * k - f64(p.x + PAD)) / f64(app.f.cell_w))
+	row = int((my * k - f64(p.y + PAD)) / f64(app.f.cell_h))
+	return clamp(col, 0, p.vt.cols - 1), clamp(row, 0, p.vt.rows - 1)
+}
+
+reports_mouse :: proc(app: ^App, p: ^Pane) -> bool {
+	// shift bypasses reporting so text can still be selected
+	return p.vt.modes & term.MOUSE_MODES != {} && .Shift not_in app.mods
+}
+
+on_mouse_button :: proc "c" (w: glfw.WindowHandle, button, action, mods: i32) {
+	app := app_of(w)
+	context = app.ctx
+	app.mods = to_mods(mods)
+	p := app.pane
+	if p == nil do return
+	col, row := mouse_cell(app, p)
+	// glfw orders buttons left, right, middle
+	btns := [3]int{0, 2, 1}
+	if button > 2 do return
+	btn := btns[button]
+	if reports_mouse(app, p) {
+		out := make([dynamic]u8, context.temp_allocator)
+		ev: term.Mouse_Event = .Press if action == glfw.PRESS else .Release
+		term.encode_mouse(p.vt, ev, btn, col, row, app.mods, &out)
+		p.mouse_btn = btn if action == glfw.PRESS else -1
+		p.mouse_cell = {col, row}
+		if len(out) > 0 do term.pty_write(p.pty, out[:])
+		return
+	}
+	t := p.vt
+	pos := term.Pos{t.hist.total - t.view + row, col}
+	switch btn {
+	case 0:
+		if action == glfw.PRESS {
+			now := glfw.GetTime()
+			if now - app.click_time < 0.4 && pos == app.click_pos {
+				app.clicks = app.clicks % 3 + 1
+			} else {
+				app.clicks = 1
+			}
+			app.click_time = now
+			app.click_pos = pos
+			p.sel.mode = Sel_Mode(app.clicks - 1)
+			p.sel.anchor = pos
+			p.sel.dragging = true
+			p.sel.active = p.sel.mode != .Char
+			extend_selection(p, pos)
+		} else {
+			p.sel.dragging = false
+		}
+	case 1:
+		if action == glfw.PRESS do paste(app, p)
+	}
+	app.dirty = true
+}
+
+extend_selection :: proc(p: ^Pane, pos: term.Pos) {
+	s := &p.sel
+	a, b := term.ordered(s.anchor, pos)
+	switch s.mode {
+	case .Char:
+		if pos != s.anchor do s.active = true
+	case .Word:
+		a, _ = term.word_bounds(p.vt, a)
+		_, b = term.word_bounds(p.vt, b)
+	case .Line:
+		a, _ = term.line_bounds(p.vt, a)
+		_, b = term.line_bounds(p.vt, b)
+	}
+	s.a, s.b = a, b
+}
+
+on_cursor_pos :: proc "c" (w: glfw.WindowHandle, x, y: f64) {
+	app := app_of(w)
+	context = app.ctx
+	p := app.pane
+	if p == nil do return
+	col, row := mouse_cell(app, p)
+	if reports_mouse(app, p) {
+		if col == p.mouse_cell.x && row == p.mouse_cell.y do return
+		p.mouse_cell = {col, row}
+		out := make([dynamic]u8, context.temp_allocator)
+		btn := p.mouse_btn if p.mouse_btn >= 0 else 3
+		term.encode_mouse(p.vt, .Motion, btn, col, row, app.mods, &out)
+		if len(out) > 0 do term.pty_write(p.pty, out[:])
+		return
+	}
+	if p.sel.dragging {
+		t := p.vt
+		_, wy := glfw.GetCursorPos(app.win)
+		// drag past the edges scrolls the view
+		if wy < 0 do term.scroll_view(t, 1)
+		if row == t.rows - 1 && wy > f64(p.y + p.h) do term.scroll_view(t, -1)
+		extend_selection(p, {t.hist.total - t.view + row, col})
+		app.dirty = true
+	}
+}
+
+on_scroll :: proc "c" (w: glfw.WindowHandle, dx, dy: f64) {
+	app := app_of(w)
+	context = app.ctx
+	p := app.pane
+	if p == nil do return
+	app.scroll_acc += dy
+	notches := int(app.scroll_acc)
+	if notches == 0 do return
+	app.scroll_acc -= f64(notches)
+	t := p.vt
+	out := make([dynamic]u8, context.temp_allocator)
+	if reports_mouse(app, p) {
+		col, row := mouse_cell(app, p)
+		for _ in 0 ..< abs(notches) do term.encode_mouse(t, .Press, 4 if notches > 0 else 5, col, row, app.mods, &out)
+	} else if t.scr == &t.alt {
+		// alternate scroll: wheel becomes cursor keys in full screen apps
+		for _ in 0 ..< abs(notches) * 3 do term.encode_key(t, .Up if notches > 0 else .Down, {}, &out)
+	} else {
+		term.scroll_view(t, notches * 3)
+		app.dirty = true
+	}
+	if len(out) > 0 do term.pty_write(p.pty, out[:])
+}
+
+on_focus :: proc "c" (w: glfw.WindowHandle, focused: i32) {
+	app := app_of(w)
+	context = app.ctx
+	app.focused = focused != 0
+	app.dirty = true
+	p := app.pane
+	if p != nil && .Focus_Events in p.vt.modes {
+		term.pty_write(p.pty, transmute([]u8)string("\x1b[I" if app.focused else "\x1b[O"))
+	}
+}
+
+paste :: proc(app: ^App, p: ^Pane) {
+	s := glfw.GetClipboardString(app.win)
+	if s == "" do return
+	out := make([dynamic]u8, context.temp_allocator)
+	term.encode_paste(p.vt, s, &out)
+	pane_input(app, p, out[:])
+}
+
+copy_selection :: proc(app: ^App, p: ^Pane) {
+	if !p.sel.active do return
+	s := term.selection_text(p.vt, p.sel.a, p.sel.b, context.temp_allocator)
+	glfw.SetClipboardString(app.win, strings.clone_to_cstring(s, context.temp_allocator))
 }

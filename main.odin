@@ -20,6 +20,23 @@ Pane :: struct {
 	x, y:   int,
 	w, h:   int,
 	exited: bool,
+	sel:    Selection,
+	mouse_btn:  int, // button held for drag reports, -1 none
+	mouse_cell: [2]int,
+}
+
+Sel_Mode :: enum u8 {
+	Char,
+	Word,
+	Line,
+}
+
+Selection :: struct {
+	active:   bool,
+	dragging: bool,
+	mode:     Sel_Mode,
+	anchor:   term.Pos,
+	a, b:     term.Pos,
 }
 
 App :: struct {
@@ -37,6 +54,11 @@ App :: struct {
 	shell:       string,
 	last_frame:  time.Tick,
 	frame_time:  time.Duration,
+	focused:     bool,
+	clicks:      int,
+	click_time:  f64,
+	click_pos:   term.Pos,
+	scroll_acc:  f64,
 }
 
 notify_main :: proc(data: rawptr) {
@@ -65,6 +87,7 @@ pane_open :: proc(app: ^App, cols, rows: int, cwd: string = "") -> ^Pane {
 		return nil
 	}
 	p.pty = pty
+	p.mouse_btn = -1
 	return p
 }
 
@@ -96,6 +119,7 @@ layout :: proc(app: ^App) {
 pane_input :: proc(app: ^App, p: ^Pane, data: []u8) {
 	if len(data) == 0 do return
 	term.pty_write(p.pty, data)
+	p.sel.active = false
 	if p.vt.view != 0 {
 		p.vt.view = 0
 		p.vt.all_dirty = true
@@ -140,8 +164,30 @@ draw_pane :: proc(app: ^App, p: ^Pane, focused: bool) {
 	push_rect(r, f32(p.x), f32(p.y), f32(p.w), f32(p.h), pack(t.bg, r.opacity))
 	flush_rects(r, .Solid)
 	draw_grid(r, &p.gpu, f, ox, oy, 0)
+	draw_selection(app, p, ox, oy)
 	draw_grid(r, &p.gpu, f, ox, oy, 1)
 	draw_cursor(app, p, ox, oy, focused)
+}
+
+// highlights an inclusive span of absolute positions in view coordinates
+highlight :: proc(app: ^App, p: ^Pane, ox, oy: int, a, b: term.Pos, color: u32) {
+	t := p.vt
+	f := &app.f
+	top := t.hist.total - t.view
+	for l in max(a.line, top) ..= min(b.line, top + t.rows - 1) {
+		x0 := a.col if l == a.line else 0
+		x1 := b.col if l == b.line else t.cols - 1
+		if x1 < x0 do continue
+		y := l - top
+		push_rect(&app.r, f32(ox + x0 * f.cell_w), f32(oy + y * f.cell_h), f32((x1 - x0 + 1) * f.cell_w), f32(f.cell_h), color)
+	}
+}
+
+draw_selection :: proc(app: ^App, p: ^Pane, ox, oy: int) {
+	if !p.sel.active do return
+	a, b := term.ordered(p.sel.a, p.sel.b)
+	highlight(app, p, ox, oy, a, b, pack(0x5577aa, 0.6))
+	flush_rects(&app.r, .Solid)
 }
 
 draw_cursor :: proc(app: ^App, p: ^Pane, ox, oy: int, focused: bool) {
@@ -192,7 +238,7 @@ render :: proc(app: ^App) {
 	w, h := glfw.GetFramebufferSize(app.win)
 	bg := app.pane.vt.bg if app.pane != nil else term.DEFAULT_BG
 	begin_frame(&app.r, int(w), int(h), bg)
-	if app.pane != nil do draw_pane(app, app.pane, true)
+	if app.pane != nil do draw_pane(app, app.pane, app.focused)
 	end_frame(&app.r)
 	glfw.SwapBuffers(app.win)
 	app.dirty = false
@@ -260,6 +306,7 @@ main :: proc() {
 	if app.pane == nil do os.exit(1)
 	layout(app)
 	app.blink_on = true
+	app.focused = true
 	app.last_input = time.tick_now()
 	blink_at := time.tick_now()
 
