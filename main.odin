@@ -23,6 +23,9 @@ Pane :: struct {
 	sel:    Selection,
 	mouse_btn:  int, // button held for drag reports, -1 none
 	mouse_cell: [2]int,
+	search:     term.Search,
+	searching:  bool,
+	query:      [dynamic]u8,
 }
 
 Sel_Mode :: enum u8 {
@@ -52,6 +55,8 @@ App :: struct {
 	blink_on:    bool,
 	last_input:  time.Tick,
 	shell:       string,
+	command:     []string,
+	cfg:         Config,
 	last_frame:  time.Tick,
 	frame_time:  time.Duration,
 	focused:     bool,
@@ -59,6 +64,17 @@ App :: struct {
 	click_time:  f64,
 	click_pos:   term.Pos,
 	scroll_acc:  f64,
+}
+
+theme_of :: proc(c: ^Config) -> (th: term.Theme) {
+	term.default_palette(&th.palette)
+	for i in 0 ..< 16 do if c.palette_set[i] do th.palette[i] = c.palette[i]
+	th.fg = c.fg
+	th.bg = c.bg
+	th.cursor_color = c.cursor_color
+	th.shape = c.cursor_shape
+	th.blink = c.cursor_blink
+	return
 }
 
 notify_main :: proc(data: rawptr) {
@@ -75,11 +91,13 @@ default_shell :: proc() -> string {
 
 pane_open :: proc(app: ^App, cols, rows: int, cwd: string = "") -> ^Pane {
 	p := new(Pane)
-	p.vt = term.make_term(cols, rows)
+	p.vt = term.make_term(cols, rows, app.cfg.scrollback)
 	term.set_cell_size(p.vt, app.f.cell_w, app.f.cell_h)
+	term.set_theme(p.vt, theme_of(&app.cfg))
 	env := []string{"TERM=xterm-256color", "COLORTERM=truecolor", "TERM_PROGRAM=votty"}
 	ws := term.Winsize{u16(rows), u16(cols), u16(cols * app.f.cell_w), u16(rows * app.f.cell_h)}
-	pty, ok := term.pty_spawn({app.shell}, env, ws, notify_main, nil)
+	argv := app.command if len(app.command) > 0 else []string{app.shell}
+	pty, ok := term.pty_spawn(argv, env, ws, notify_main, nil)
 	if !ok {
 		fmt.eprintln("votty: cannot spawn", app.shell)
 		term.destroy_term(p.vt)
@@ -95,6 +113,8 @@ pane_close :: proc(p: ^Pane) {
 	term.pty_close(p.pty)
 	term.destroy_term(p.vt)
 	pane_gpu_free(&p.gpu)
+	term.search_free(&p.search)
+	delete(p.query)
 	delete(p.buf)
 	free(p)
 }
@@ -165,8 +185,63 @@ draw_pane :: proc(app: ^App, p: ^Pane, focused: bool) {
 	flush_rects(r, .Solid)
 	draw_grid(r, &p.gpu, f, ox, oy, 0)
 	draw_selection(app, p, ox, oy)
+	if p.searching do draw_matches(app, p, ox, oy)
 	draw_grid(r, &p.gpu, f, ox, oy, 1)
 	draw_cursor(app, p, ox, oy, focused)
+	if p.searching do draw_search_bar(app, p)
+}
+
+draw_matches :: proc(app: ^App, p: ^Pane, ox, oy: int) {
+	t := p.vt
+	top := t.hist.total - t.view
+	ms := make([dynamic]term.Match, context.temp_allocator)
+	for l in top ..< top + t.rows do term.line_matches(t, &p.search, l, &ms)
+	cur := p.search.current
+	for m in ms {
+		is_cur := p.search.found && m == cur
+		color := pack(0xe0a030, 0.9) if is_cur else pack(0x807020, 0.6)
+		highlight(app, p, ox, oy, {m.line, m.col}, {m.line, m.col + m.len - 1}, color)
+	}
+	flush_rects(&app.r, .Solid)
+}
+
+draw_search_bar :: proc(app: ^App, p: ^Pane) {
+	r := &app.r
+	f := &app.f
+	h := f.cell_h + 2
+	y := f32(p.y + p.h - h)
+	s := &p.search
+	status := "searching" if s.active else ("" if s.found || len(p.query) == 0 else "no match")
+	mode := "Aa" if s.case_sensitive else "aa"
+	label := "find: "
+	right := fmt.tprintf("%s  [%s alt+c]  enter/shift+enter  esc", status, mode)
+	rx := f32(p.x + p.w - PAD - text_width(f, right))
+	qx := f32(p.x + PAD + text_width(f, label))
+	qw := min(f32(text_width(f, string(p.query[:]))), max(rx - f32(f.cell_w) - qx, 0))
+	push_rect(r, f32(p.x), y, f32(p.w), f32(h), pack(0x30343c, 1))
+	push_rect(r, f32(p.x), y, f32(p.w), 1, pack(0x5577aa, 1))
+	push_rect(r, qx + qw, y + 1, 2, f32(f.cell_h), pack(0xffffff, 1))
+	flush_rects(r, .Solid)
+	draw_text(r, f, f32(p.x + PAD), y + 1, label, pack(0x8899aa, 1))
+	draw_text(r, f, qx, y + 1, string(p.query[:]), pack(0xffffff, 1), rx - f32(f.cell_w))
+	draw_text(r, f, rx, y + 1, right, pack(0x8899aa, 1))
+	flush_rects(r, .Glyph, f.tex)
+}
+
+// advances a running search and brings its match into view
+pane_search_tick :: proc(app: ^App, p: ^Pane) {
+	s := &p.search
+	if !p.searching do return
+	term.search_validate(p.vt, s)
+	if !s.active do return
+	if term.search_step(p.vt, s, 20000) && s.found do reveal(p.vt, s.current.line)
+	app.dirty = true
+}
+
+reveal :: proc(t: ^term.Term, line: int) {
+	top := t.hist.total - t.view
+	if line >= top && line < top + t.rows do return
+	term.scroll_view(t, (t.hist.total - (line - t.rows / 2)) - t.view)
 }
 
 // highlights an inclusive span of absolute positions in view coordinates
@@ -245,14 +320,56 @@ render :: proc(app: ^App) {
 	app.last_frame = time.tick_now()
 }
 
+usage :: proc() {
+	fmt.eprintln("usage: votty [-c config] [-o key=value]... [-e command args...]")
+	os.exit(2)
+}
+
 main :: proc() {
 	app := new(App)
 	defer free(app)
 	app.ctx = context
-	app.shell = default_shell()
-	defer delete(app.shell)
 	posix.signal(.SIGPIPE, auto_cast posix.SIG_IGN)
 
+	config_defaults(&app.cfg)
+	defer config_destroy(&app.cfg)
+	args := os.args[1:]
+	cfg_file := config_path()
+	overrides := make([dynamic]string, context.temp_allocator)
+	for i := 0; i < len(args); i += 1 {
+		switch args[i] {
+		case "-c", "--config":
+			if i + 1 >= len(args) do usage()
+			i += 1
+			cfg_file = args[i]
+		case "-o":
+			if i + 1 >= len(args) do usage()
+			i += 1
+			append(&overrides, args[i])
+		case "-e":
+			if i + 1 >= len(args) do usage()
+			app.command = args[i + 1:]
+			i = len(args)
+		case:
+			usage()
+		}
+	}
+	config_load(&app.cfg, cfg_file)
+	for o in overrides {
+		eq := strings.index_byte(o, '=')
+		if eq < 0 || !config_set(&app.cfg, strings.trim_space(o[:eq]), strings.trim_space(o[eq + 1:])) {
+			fmt.eprintln("votty: invalid option", o)
+		}
+	}
+	app.shell = strings.clone(app.cfg.shell) if app.cfg.shell != "" else default_shell()
+	defer delete(app.shell)
+
+	switch app.cfg.platform {
+	case "x11":
+		glfw.InitHint(glfw.PLATFORM, glfw.PLATFORM_X11)
+	case "wayland":
+		glfw.InitHint(glfw.PLATFORM, glfw.PLATFORM_WAYLAND)
+	}
 	if !glfw.Init() {
 		fmt.eprintln("votty: glfw init failed")
 		os.exit(1)
@@ -264,6 +381,7 @@ main :: proc() {
 	glfw.WindowHint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
 	glfw.WindowHint(glfw.OPENGL_FORWARD_COMPAT, true)
 	glfw.WindowHint(glfw.SCALE_TO_MONITOR, true)
+	if app.cfg.opacity < 1 do glfw.WindowHint(glfw.TRANSPARENT_FRAMEBUFFER, true)
 
 	app.win = glfw.CreateWindow(960, 600, "votty", nil, nil)
 	if app.win == nil {
@@ -283,14 +401,22 @@ main :: proc() {
 		os.exit(1)
 	}
 	defer renderer_destroy(&app.r)
+	app.r.opacity = app.cfg.opacity
+	app.r.bold_bright = app.cfg.bold_bright
 
 	sx, _ := glfw.GetWindowContentScale(app.win)
 	app.scale = max(sx, 1)
-	if !fonts_init(&app.f, "monospace", 11, app.scale) {
+	if !fonts_init(&app.f, app.cfg.font, app.cfg.font_size, app.scale) {
 		fmt.eprintln("votty: no usable font found")
 		os.exit(1)
 	}
 	defer fonts_destroy(&app.f)
+
+	// size the window from the configured grid; glfw scales window coordinates itself
+	ww, _ := glfw.GetWindowSize(app.win)
+	fw, _ := glfw.GetFramebufferSize(app.win)
+	k := f64(fw) / f64(max(ww, 1))
+	glfw.SetWindowSize(app.win, i32(f64(app.cfg.width * app.f.cell_w + 2 * PAD) / k), i32(f64(app.cfg.height * app.f.cell_h + 2 * PAD) / k))
 
 	if glfw.GetPlatform() == glfw.PLATFORM_WAYLAND {
 		app.frame_time = time.Second / 60
@@ -327,6 +453,7 @@ main :: proc() {
 			if .Cursor_Blink in app.pane.vt.modes do app.dirty = true
 		}
 		if !pane_pump(app, app.pane) do break
+		pane_search_tick(app, app.pane)
 		if app.dirty && time.tick_since(app.last_frame) >= app.frame_time do render(app)
 		free_all(context.temp_allocator)
 	}

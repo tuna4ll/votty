@@ -130,7 +130,17 @@ Term :: struct {
 	clip_dirty:   bool,
 	out:          [dynamic]u8, // replies for the pty
 	all_dirty:    bool,
+	theme:        Theme,
 	output_seq:   u64, // bumped on content changes, used by search
+}
+
+// user defaults restored by resets
+Theme :: struct {
+	palette:      [256]u32,
+	fg, bg:       u32,
+	cursor_color: u32,
+	shape:        Cursor_Shape,
+	blink:        bool,
 }
 
 DEFAULT_FG :: 0xd8d8d8
@@ -163,11 +173,11 @@ make_term :: proc(cols, rows: int, history_limit := 10000) -> ^Term {
 	t.scr = &t.primary
 	t.hist.lines = make([]History_Line, max(history_limit, 1))
 	t.tabs = make([]bool, t.cols)
-	default_palette(&t.palette)
-	t.fg = DEFAULT_FG
-	t.bg = DEFAULT_BG
-	t.cursor_color = DEFAULT_FG
-	reset(t)
+	default_palette(&t.theme.palette)
+	t.theme.fg = DEFAULT_FG
+	t.theme.bg = DEFAULT_BG
+	t.theme.cursor_color = DEFAULT_FG
+	set_theme(t, t.theme)
 	return t
 }
 
@@ -185,13 +195,23 @@ destroy_term :: proc(t: ^Term) {
 	free(t)
 }
 
+set_theme :: proc(t: ^Term, th: Theme) {
+	t.theme = th
+	t.palette = th.palette
+	t.fg = th.fg
+	t.bg = th.bg
+	t.cursor_color = th.cursor_color
+	reset(t)
+}
+
 reset :: proc(t: ^Term) {
 	t.modes = {.Wrap, .Cursor_Visible}
+	if t.theme.blink do t.modes += {.Cursor_Blink}
 	t.cur = {}
 	t.cur.charset = {'B', 'B'}
 	t.top = 0
 	t.bot = t.rows - 1
-	t.shape = .Block
+	t.shape = t.theme.shape
 	t.scr = &t.primary
 	t.primary.saved = t.cur
 	t.alt.saved = t.cur

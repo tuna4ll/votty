@@ -1,6 +1,7 @@
 package main
 
 import "core:strings"
+import "core:unicode/utf8"
 import "term"
 import "vendor:glfw"
 
@@ -78,6 +79,10 @@ on_key :: proc "c" (w: glfw.WindowHandle, key, scancode, action, mods: i32) {
 	app.mods = m
 	if action == glfw.RELEASE do return
 	app.skip_char = false
+	if app.pane != nil && app.pane.searching && search_key(app, app.pane, key, m) {
+		app.skip_char = true
+		return
+	}
 	if handle_shortcut(app, key, m) {
 		app.skip_char = true
 		return
@@ -106,6 +111,13 @@ on_char :: proc "c" (w: glfw.WindowHandle, ch: rune) {
 	}
 	p := app.pane
 	if p == nil do return
+	if p.searching {
+		b, n := utf8.encode_rune(ch)
+		append(&p.query, ..b[:n])
+		restart_search(p)
+		app.dirty = true
+		return
+	}
 	out := make([dynamic]u8, context.temp_allocator)
 	term.encode_char(ch, app.mods & {.Alt}, &out)
 	pane_input(app, p, out[:])
@@ -149,37 +161,46 @@ install_callbacks :: proc(app: ^App) {
 }
 
 handle_shortcut :: proc(app: ^App, key: i32, m: term.Mods) -> bool {
+	action := lookup_binding(&app.cfg, key, m)
+	if action == .None do return false
+	return run_action(app, action)
+}
+
+run_action :: proc(app: ^App, action: Action) -> bool {
 	p := app.pane
-	if m == {.Shift} && p != nil && p.vt.scr == &p.vt.primary {
-		t := p.vt
-		switch key {
-		case glfw.KEY_PAGE_UP:
-			term.scroll_view(t, t.rows - 1)
-		case glfw.KEY_PAGE_DOWN:
-			term.scroll_view(t, -(t.rows - 1))
-		case glfw.KEY_HOME:
-			term.scroll_view(t, t.hist.count)
-		case glfw.KEY_END:
-			term.scroll_view(t, -t.view)
-		case:
-			return false
-		}
-		app.dirty = true
-		return true
-	}
-	if m != {.Ctrl, .Shift} do return false
-	switch key {
-	case glfw.KEY_C:
-		if p != nil do copy_selection(app, p)
-	case glfw.KEY_EQUAL:
+	if p == nil do return false
+	t := p.vt
+	#partial switch action {
+	case .Copy:
+		copy_selection(app, p)
+	case .Paste:
+		paste(app, p)
+	case .Search:
+		p.searching = true
+		restart_search(p)
+	case .Font_Up:
 		set_font_size(app, app.f.size + 1)
-	case glfw.KEY_MINUS:
+	case .Font_Down:
 		set_font_size(app, app.f.size - 1)
-	case glfw.KEY_V:
-		if p != nil do paste(app, p)
+	case .Font_Reset:
+		set_font_size(app, app.cfg.font_size)
+	case .Scroll_Page_Up, .Scroll_Page_Down, .Scroll_Top, .Scroll_Bottom:
+		// full screen apps get these keys themselves
+		if t.scr != &t.primary do return false
+		#partial switch action {
+		case .Scroll_Page_Up:
+			term.scroll_view(t, t.rows - 1)
+		case .Scroll_Page_Down:
+			term.scroll_view(t, -(t.rows - 1))
+		case .Scroll_Top:
+			term.scroll_view(t, t.hist.count)
+		case .Scroll_Bottom:
+			term.scroll_view(t, -t.view)
+		}
 	case:
 		return false
 	}
+	app.dirty = true
 	return true
 }
 
@@ -335,4 +356,51 @@ copy_selection :: proc(app: ^App, p: ^Pane) {
 	if !p.sel.active do return
 	s := term.selection_text(p.vt, p.sel.a, p.sel.b, context.temp_allocator)
 	glfw.SetClipboardString(app.win, strings.clone_to_cstring(s, context.temp_allocator))
+}
+
+restart_search :: proc(p: ^Pane) {
+	t := p.vt
+	term.search_start(t, &p.search, string(p.query[:]), t.hist.total - t.view + t.rows - 1)
+}
+
+// keys while the search bar is open; returns true when consumed
+search_key :: proc(app: ^App, p: ^Pane, key: i32, m: term.Mods) -> bool {
+	app.dirty = true
+	switch key {
+	case glfw.KEY_ESCAPE:
+		p.searching = false
+		p.search.found = false
+	case glfw.KEY_ENTER, glfw.KEY_KP_ENTER:
+		term.search_next(p.vt, &p.search, 1 if .Shift in m else -1)
+	case glfw.KEY_UP:
+		term.search_next(p.vt, &p.search, -1)
+	case glfw.KEY_DOWN:
+		term.search_next(p.vt, &p.search, 1)
+	case glfw.KEY_BACKSPACE:
+		n := len(p.query)
+		for n > 0 {
+			n -= 1
+			if p.query[n] & 0xc0 != 0x80 do break
+		}
+		resize(&p.query, n)
+		restart_search(p)
+	case glfw.KEY_C:
+		if m != {.Alt} do return false
+		p.search.case_sensitive = !p.search.case_sensitive
+		restart_search(p)
+	case:
+		#partial switch lookup_binding(&app.cfg, key, m) {
+		case .Search:
+			p.searching = false
+			p.search.found = false
+			return true
+		case .Paste:
+			append(&p.query, glfw.GetClipboardString(app.win))
+			restart_search(p)
+			return true
+		}
+		// swallow other control combos so they do not leak into the shell
+		return m & {.Ctrl, .Alt, .Super} != {} || map_key(key) != .None
+	}
+	return true
 }

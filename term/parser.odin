@@ -376,12 +376,8 @@ esc_dispatch :: proc(t: ^Term, inter, final: u8) {
 }
 
 full_reset :: proc(t: ^Term) {
-	t.fg = DEFAULT_FG
-	t.bg = DEFAULT_BG
-	t.cursor_color = DEFAULT_FG
-	default_palette(&t.palette)
 	t.view = 0
-	reset(t)
+	set_theme(t, t.theme)
 }
 
 @(private)
@@ -419,7 +415,9 @@ csi_dispatch :: proc(t: ^Term, final: u8) {
 		switch {
 		case p.inter == ' ' && final == 'q':
 			switch param(t, 0, 0) {
-			case 0, 1, 2:
+			case 0:
+				t.shape = t.theme.shape
+			case 1, 2:
 				t.shape = .Block
 			case 3, 4:
 				t.shape = .Underline
@@ -427,7 +425,8 @@ csi_dispatch :: proc(t: ^Term, final: u8) {
 				t.shape = .Bar
 			}
 			ps := param(t, 0, 0)
-			if ps == 0 || ps % 2 == 1 {t.modes += {.Cursor_Blink}} else {t.modes -= {.Cursor_Blink}}
+			blink := t.theme.blink if ps == 0 else ps % 2 == 1
+			if blink {t.modes += {.Cursor_Blink}} else {t.modes -= {.Cursor_Blink}}
 		case p.inter == '!' && final == 'p':
 			soft_reset(t)
 		case p.inter == '$' && final == 'p':
@@ -839,23 +838,21 @@ osc_dispatch :: proc(t: ^Term, s: string) {
 		t.clip_dirty = true
 	case 104:
 		if rest == "" {
-			default_palette(&t.palette)
+			t.palette = t.theme.palette
 		} else {
-			def: [256]u32
-			default_palette(&def)
 			for f in strings.split_iterator(&rest, ";") {
-				if n, nok := strconv.parse_int(f, 10); nok && n >= 0 && n < 256 do t.palette[n] = def[n]
+				if n, nok := strconv.parse_int(f, 10); nok && n >= 0 && n < 256 do t.palette[n] = t.theme.palette[n]
 			}
 		}
 		t.all_dirty = true
 	case 110:
-		t.fg = DEFAULT_FG
+		t.fg = t.theme.fg
 		t.all_dirty = true
 	case 111:
-		t.bg = DEFAULT_BG
+		t.bg = t.theme.bg
 		t.all_dirty = true
 	case 112:
-		t.cursor_color = DEFAULT_FG
+		t.cursor_color = t.theme.cursor_color
 	}
 }
 
