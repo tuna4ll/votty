@@ -290,6 +290,8 @@ finish_string :: proc(t: ^Term) {
 		osc_dispatch(t, string(p.str[:]))
 	case .Dcs:
 		dcs_dispatch(t, string(p.str[:]))
+	case .Apc:
+		if len(p.str) > 0 && p.str[0] == 'G' do graphics_command(t, p.str[1:])
 	}
 	// drop large buffers so a single image does not pin memory
 	if cap(p.str) > 1 << 20 {
@@ -377,6 +379,7 @@ esc_dispatch :: proc(t: ^Term, inter, final: u8) {
 
 full_reset :: proc(t: ^Term) {
 	t.view = 0
+	graphics_reset(t)
 	set_theme(t, t.theme)
 }
 

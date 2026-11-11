@@ -113,7 +113,9 @@ pane_open :: proc(app: ^App, cols, rows: int, cwd: string = "") -> ^Pane {
 	return p
 }
 
-pane_close :: proc(p: ^Pane) {
+pane_close :: proc(app: ^App, p: ^Pane) {
+	for img in p.vt.gfx.images do append(&p.vt.gfx.dropped, img.serial)
+	release_textures(&app.r, &p.vt.gfx)
 	term.pty_close(p.pty)
 	term.destroy_term(p.vt)
 	pane_gpu_free(&p.gpu)
@@ -155,6 +157,10 @@ pane_pump :: proc(app: ^App, p: ^Pane) -> bool {
 		term.feed(p.vt, p.buf[:])
 		app.dirty = true
 	}
+	if p.vt.gfx.changed {
+		p.vt.gfx.changed = false
+		app.dirty = true
+	}
 	t := p.vt
 	if len(t.out) > 0 {
 		term.pty_write(p.pty, t.out[:])
@@ -183,10 +189,13 @@ draw_pane :: proc(app: ^App, p: ^Pane, focused: bool) {
 	clip(r, p.x, p.y, p.w, p.h)
 	push_rect(r, f32(p.x), f32(p.y), f32(p.w), f32(p.h), pack(t.bg, r.opacity))
 	flush_rects(r, .Solid)
+	release_textures(r, &t.gfx)
 	draw_grid(r, &p.gpu, f, ox, oy, 0)
+	draw_images(r, f, t, ox, oy, true)
 	draw_selection(app, p, ox, oy)
 	if p.searching do draw_matches(app, p, ox, oy)
 	draw_grid(r, &p.gpu, f, ox, oy, 1)
+	draw_images(r, f, t, ox, oy, false)
 	draw_cursor(app, p, ox, oy, focused)
 	if p.searching do draw_search_bar(app, p)
 }

@@ -131,6 +131,7 @@ Term :: struct {
 	out:          [dynamic]u8, // replies for the pty
 	all_dirty:    bool,
 	theme:        Theme,
+	gfx:          Graphics,
 	output_seq:   u64, // bumped on content changes, used by search
 }
 
@@ -192,6 +193,7 @@ destroy_term :: proc(t: ^Term) {
 	delete(t.clipboard)
 	delete(t.out)
 	parser_free(&t.parser)
+	graphics_free(&t.gfx)
 	free(t)
 }
 
@@ -287,6 +289,7 @@ history_push :: proc(t: ^Term, cells: []Cell, wrapped: bool) {
 	} else {
 		slot = &h.lines[h.head]
 		h.head = (h.head + 1) % cap
+		graphics_drop_before(t, h.total - h.count + 1)
 	}
 	n := len(cells)
 	for n > 0 && cells[n - 1] == {} do n -= 1
@@ -341,6 +344,7 @@ scroll_up :: proc(t: ^Term, top, bot, count: int) {
 	n := min(count, bot - top + 1)
 	if n <= 0 do return
 	push := s == &t.primary && top == 0 && bot == t.rows - 1
+	if !push do graphics_scroll(t, top, bot, -n)
 	b := blank(t)
 	for _ in 0 ..< n {
 		p := s.lines[top]
@@ -360,6 +364,7 @@ scroll_down :: proc(t: ^Term, top, bot, count: int) {
 	s := t.scr
 	n := min(count, bot - top + 1)
 	if n <= 0 do return
+	graphics_scroll(t, top, bot, n)
 	b := blank(t)
 	for _ in 0 ..< n {
 		p := s.lines[bot]
@@ -504,7 +509,9 @@ erase_display :: proc(t: ^Term, mode: int) {
 			erase_cells(t, y, 0, t.cols)
 			t.scr.wrapped[t.scr.lines[y]] = false
 		}
+		graphics_clear_screen(t)
 	case 3:
+		graphics_drop_before(t, t.hist.total)
 		for &l in t.hist.lines do clear(&l.cells)
 		t.hist.count = 0
 		t.hist.head = 0
@@ -526,6 +533,7 @@ delete_lines :: proc(t: ^Term, count: int) {
 	// a deleted line never enters history
 	s := t.scr
 	n := min(count, t.bot - t.cur.y + 1)
+	graphics_scroll(t, t.cur.y, t.bot, -n)
 	b := blank(t)
 	for _ in 0 ..< n {
 		p := s.lines[t.cur.y]
@@ -672,6 +680,7 @@ resize_term :: proc(t: ^Term, new_cols, new_rows: int) {
 	screen_free(&t.alt)
 	t.alt = na
 	t.scr = &t.alt if on_alt else &t.primary
+	graphics_resize(t, shift - pull - ashift)
 
 	if on_alt {
 		t.cur.y -= ashift

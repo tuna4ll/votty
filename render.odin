@@ -160,6 +160,7 @@ Renderer :: struct {
 	fence:      gl.sync_t,
 	fb_w, fb_h: int,
 	opacity:    f32,
+	textures:   map[u64]u32, // image serial -> texture
 	bold_bright: bool,
 	stats:      struct {
 		rows_written: int,
@@ -221,6 +222,11 @@ renderer_destroy :: proc(r: ^Renderer) {
 	gl.DeleteVertexArrays(1, &r.rect_vao)
 	gl.DeleteBuffers(1, &r.rect_vbo)
 	if r.fence != nil do gl.DeleteSync(r.fence)
+	for _, tex in r.textures {
+		tex := tex
+		gl.DeleteTextures(1, &tex)
+	}
+	delete(r.textures)
 	delete(r.rects)
 }
 
@@ -487,4 +493,55 @@ text_width :: proc(f: ^Fonts, s: string) -> int {
 	n := 0
 	for ch in s do n += term.rune_width(ch)
 	return n * f.cell_w
+}
+
+texture_for :: proc(r: ^Renderer, img: ^term.Image) -> u32 {
+	if tex, ok := r.textures[img.serial]; ok do return tex
+	tex: u32
+	gl.GenTextures(1, &tex)
+	gl.BindTexture(gl.TEXTURE_2D, tex)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+	gl.PixelStorei(gl.UNPACK_ALIGNMENT, 1)
+	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, i32(img.w), i32(img.h), 0, gl.RGBA, gl.UNSIGNED_BYTE, raw_data(img.rgba))
+	r.textures[img.serial] = tex
+	return tex
+}
+
+// releases textures of images the terminal has dropped
+release_textures :: proc(r: ^Renderer, g: ^term.Graphics) {
+	for serial in g.dropped {
+		if tex, ok := r.textures[serial]; ok {
+			tex := tex
+			gl.DeleteTextures(1, &tex)
+			delete_key(&r.textures, serial)
+		}
+	}
+	clear(&g.dropped)
+}
+
+draw_images :: proc(r: ^Renderer, f: ^Fonts, t: ^term.Term, ox, oy: int, below: bool) {
+	g := &t.gfx
+	alt := t.scr == &t.alt
+	top := t.hist.total - t.view
+	for pl in g.placements {
+		if pl.alt != alt || (pl.z < 0) != below do continue
+		y := pl.line - top
+		if y + pl.rows <= 0 || y >= t.rows do continue
+		img := term.find_image(g, pl.image)
+		if img == nil || img.w == 0 || img.h == 0 do continue
+		tex := texture_for(r, img)
+		px := f32(ox + pl.col * f.cell_w + pl.off[0])
+		py := f32(oy + y * f.cell_h + pl.off[1])
+		w, h := f32(pl.src[2]), f32(pl.src[3])
+		if pl.fit {
+			w = f32(pl.cols * f.cell_w - pl.off[0])
+			h = f32(pl.rows * f.cell_h - pl.off[1])
+		}
+		iw, ih := f32(img.w), f32(img.h)
+		append(&r.rects, Rect{px, py, w, h, f32(pl.src[0]) / iw, f32(pl.src[1]) / ih, f32(pl.src[0] + pl.src[2]) / iw, f32(pl.src[1] + pl.src[3]) / ih, 0xffffffff})
+		flush_rects(r, .Image, tex)
+	}
 }

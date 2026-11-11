@@ -211,7 +211,7 @@ remove_pane :: proc(app: ^App, p: ^Pane) {
 				app.space = clamp(app.space, 0, max(len(app.spaces) - 1, 0))
 			}
 			if app.drag == p do app.drag = nil
-			pane_close(p)
+			pane_close(app, p)
 			free(n)
 			layout(app)
 			return
