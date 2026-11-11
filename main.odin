@@ -26,6 +26,7 @@ Pane :: struct {
 	search:     term.Search,
 	searching:  bool,
 	query:      [dynamic]u8,
+	node:       ^Node,
 }
 
 Sel_Mode :: enum u8 {
@@ -47,7 +48,10 @@ App :: struct {
 	win:         glfw.WindowHandle,
 	r:           Renderer,
 	f:           Fonts,
-	pane:        ^Pane,
+	spaces:      [dynamic]^Workspace,
+	space:       int,
+	drag:        ^Pane, // pane receiving a mouse drag
+	tab_hits:    [dynamic]Tab_Hit,
 	dirty:       bool,
 	scale:       f32,
 	mods:        term.Mods,
@@ -97,7 +101,7 @@ pane_open :: proc(app: ^App, cols, rows: int, cwd: string = "") -> ^Pane {
 	env := []string{"TERM=xterm-256color", "COLORTERM=truecolor", "TERM_PROGRAM=votty"}
 	ws := term.Winsize{u16(rows), u16(cols), u16(cols * app.f.cell_w), u16(rows * app.f.cell_h)}
 	argv := app.command if len(app.command) > 0 else []string{app.shell}
-	pty, ok := term.pty_spawn(argv, env, ws, notify_main, nil)
+	pty, ok := term.pty_spawn(argv, env, ws, notify_main, nil, cwd)
 	if !ok {
 		fmt.eprintln("votty: cannot spawn", app.shell)
 		term.destroy_term(p.vt)
@@ -130,11 +134,6 @@ pane_layout :: proc(app: ^App, p: ^Pane, x, y, w, h: int) {
 	}
 }
 
-layout :: proc(app: ^App) {
-	w, h := glfw.GetFramebufferSize(app.win)
-	if app.pane != nil do pane_layout(app, app.pane, 0, 0, int(w), int(h))
-	app.dirty = true
-}
 
 pane_input :: proc(app: ^App, p: ^Pane, data: []u8) {
 	if len(data) == 0 do return
@@ -164,7 +163,8 @@ pane_pump :: proc(app: ^App, p: ^Pane) -> bool {
 	term.pty_flush(p.pty)
 	if t.title_dirty {
 		t.title_dirty = false
-		glfw.SetWindowTitle(app.win, strings.clone_to_cstring(string(t.title[:]), context.temp_allocator))
+		if p == focused(app) do update_title(app)
+		app.dirty = true
 	}
 	if t.clip_dirty {
 		t.clip_dirty = false
@@ -311,9 +311,15 @@ draw_cursor :: proc(app: ^App, p: ^Pane, ox, oy: int, focused: bool) {
 
 render :: proc(app: ^App) {
 	w, h := glfw.GetFramebufferSize(app.win)
-	bg := app.pane.vt.bg if app.pane != nil else term.DEFAULT_BG
+	fp := focused(app)
+	bg := fp.vt.bg if fp != nil else app.cfg.bg
 	begin_frame(&app.r, int(w), int(h), bg)
-	if app.pane != nil do draw_pane(app, app.pane, app.focused)
+	if t := cur_tab(app); t != nil {
+		for n in tab_panes(t) do draw_pane(app, n.pane, app.focused && n == t.focus)
+	}
+	draw_borders(app)
+	no_clip(&app.r)
+	draw_tab_bar(app)
 	end_frame(&app.r)
 	glfw.SwapBuffers(app.win)
 	app.dirty = false
@@ -425,12 +431,12 @@ main :: proc() {
 		}
 	}
 	install_callbacks(app)
-	w, h := glfw.GetFramebufferSize(app.win)
-	cols := max((int(w) - 2 * PAD) / app.f.cell_w, 1)
-	rows := max((int(h) - 2 * PAD) / app.f.cell_h, 1)
-	app.pane = pane_open(app, cols, rows)
-	if app.pane == nil do os.exit(1)
-	layout(app)
+	if !new_workspace(app) do os.exit(1)
+	defer {
+		for len(app.spaces) > 0 do close_workspace(app)
+		delete(app.spaces)
+		delete(app.tab_hits)
+	}
 	app.blink_on = true
 	app.focused = true
 	app.last_input = time.tick_now()
@@ -450,12 +456,17 @@ main :: proc() {
 		if time.tick_since(blink_at) >= 500 * time.Millisecond {
 			blink_at = time.tick_now()
 			app.blink_on = !app.blink_on
-			if .Cursor_Blink in app.pane.vt.modes do app.dirty = true
+			if p := focused(app); p != nil && .Cursor_Blink in p.vt.modes do app.dirty = true
 		}
-		if !pane_pump(app, app.pane) do break
-		pane_search_tick(app, app.pane)
+		for p in all_panes(app) {
+			if !pane_pump(app, p) {
+				remove_pane(app, p)
+				continue
+			}
+			pane_search_tick(app, p)
+		}
+		if len(app.spaces) == 0 do break
 		if app.dirty && time.tick_since(app.last_frame) >= app.frame_time do render(app)
 		free_all(context.temp_allocator)
 	}
-	pane_close(app.pane)
 }

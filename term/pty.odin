@@ -1,6 +1,7 @@
 package term
 
 import "base:runtime"
+import "core:fmt"
 import "core:strings"
 import "core:sync"
 import "core:sys/linux"
@@ -42,7 +43,7 @@ Pty :: struct {
 }
 
 // spawns argv[0] on a fresh pty; extra env entries are "KEY=value"
-pty_spawn :: proc(argv: []string, env: []string, ws: Winsize, notify: proc(data: rawptr) = nil, userdata: rawptr = nil) -> (p: ^Pty, ok: bool) {
+pty_spawn :: proc(argv: []string, env: []string, ws: Winsize, notify: proc(data: rawptr) = nil, userdata: rawptr = nil, cwd := "") -> (p: ^Pty, ok: bool) {
 	master, err := linux.open("/dev/ptmx", {.RDWR, .NOCTTY, .CLOEXEC, .NONBLOCK})
 	if err != nil do return nil, false
 	unlock: i32 = 0
@@ -82,6 +83,7 @@ pty_spawn :: proc(argv: []string, env: []string, ws: Winsize, notify: proc(data:
 		append(&cenv, c_environ[i])
 	}
 	append(&cenv, nil)
+	ccwd := strings.clone_to_cstring(cwd, context.temp_allocator) if cwd != "" else nil
 
 	pid, ferr := linux.fork()
 	if ferr != nil {
@@ -89,7 +91,7 @@ pty_spawn :: proc(argv: []string, env: []string, ws: Winsize, notify: proc(data:
 		pty_free(p)
 		return nil, false
 	}
-	if pid == 0 do child_exec(slave, raw_data(cargv), raw_data(cenv))
+	if pid == 0 do child_exec(slave, raw_data(cargv), raw_data(cenv), ccwd)
 
 	linux.close(slave)
 	p.pid = pid
@@ -98,8 +100,9 @@ pty_spawn :: proc(argv: []string, env: []string, ws: Winsize, notify: proc(data:
 }
 
 @(private)
-child_exec :: proc "contextless" (slave: linux.Fd, argv, envp: [^]cstring) -> ! {
+child_exec :: proc "contextless" (slave: linux.Fd, argv, envp: [^]cstring, cwd: cstring) -> ! {
 	linux.setsid()
+	if cwd != nil do linux.chdir(cwd)
 	linux.ioctl(slave, TIOCSCTTY, 0)
 	linux.dup2(slave, 0)
 	linux.dup2(slave, 1)
@@ -252,6 +255,16 @@ pty_free :: proc(p: ^Pty) {
 	delete(p.pending)
 	delete(p.outq)
 	free(p)
+}
+
+// working directory of the child, read from procfs
+pty_cwd :: proc(p: ^Pty, allocator := context.allocator) -> string {
+	buf: [64]u8
+	path := fmt.bprintf(buf[:], "/proc/%d/cwd\x00", p.pid)
+	out: [4096]u8
+	n, err := linux.readlink(cstring(raw_data(path)), out[:])
+	if err != nil || n <= 0 do return ""
+	return strings.clone(string(out[:n]), allocator)
 }
 
 exit_code :: proc(p: ^Pty) -> int {

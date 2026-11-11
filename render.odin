@@ -415,6 +415,10 @@ clip :: proc(r: ^Renderer, x, y, w, h: int) {
 	gl.Scissor(i32(x), i32(r.fb_h - y - h), i32(max(w, 0)), i32(max(h, 0)))
 }
 
+no_clip :: proc(r: ^Renderer) {
+	gl.Disable(gl.SCISSOR_TEST)
+}
+
 draw_grid :: proc(r: ^Renderer, g: ^Pane_Gpu, f: ^Fonts, x, y: int, pass: i32) {
 	gl.UseProgram(r.grid)
 	gl.Uniform2f(r.grid_u.origin, f32(x), f32(y))

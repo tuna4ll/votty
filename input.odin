@@ -79,7 +79,7 @@ on_key :: proc "c" (w: glfw.WindowHandle, key, scancode, action, mods: i32) {
 	app.mods = m
 	if action == glfw.RELEASE do return
 	app.skip_char = false
-	if app.pane != nil && app.pane.searching && search_key(app, app.pane, key, m) {
+	if fp := focused(app); fp != nil && fp.searching && search_key(app, fp, key, m) {
 		app.skip_char = true
 		return
 	}
@@ -87,7 +87,7 @@ on_key :: proc "c" (w: glfw.WindowHandle, key, scancode, action, mods: i32) {
 		app.skip_char = true
 		return
 	}
-	p := app.pane
+	p := focused(app)
 	if p == nil do return
 	out := make([dynamic]u8, context.temp_allocator)
 	if k := map_key(key); k != .None {
@@ -109,7 +109,7 @@ on_char :: proc "c" (w: glfw.WindowHandle, ch: rune) {
 		app.skip_char = false
 		return
 	}
-	p := app.pane
+	p := focused(app)
 	if p == nil do return
 	if p.searching {
 		b, n := utf8.encode_rune(ch)
@@ -167,7 +167,47 @@ handle_shortcut :: proc(app: ^App, key: i32, m: term.Mods) -> bool {
 }
 
 run_action :: proc(app: ^App, action: Action) -> bool {
-	p := app.pane
+	#partial switch action {
+	case .New_Tab:
+		new_tab(app)
+	case .Close_Tab:
+		close_tab(app)
+	case .Next_Tab:
+		if ws := cur_space(app); ws != nil do switch_tab(app, ws.cur + 1)
+	case .Prev_Tab:
+		if ws := cur_space(app); ws != nil do switch_tab(app, ws.cur - 1)
+	case .Tab_1 ..= .Tab_9:
+		ws := cur_space(app)
+		i := int(action - .Tab_1)
+		if ws == nil || i >= len(ws.tabs) do return false
+		switch_tab(app, i)
+	case .Split_Right:
+		split(app, false)
+	case .Split_Down:
+		split(app, true)
+	case .Close_Pane:
+		if p := focused(app); p != nil do remove_pane(app, p)
+	case .Focus_Left ..= .Focus_Down:
+		move_focus(app, Dir(action - .Focus_Left))
+	case .Resize_Left ..= .Resize_Down:
+		resize_split(app, Dir(action - .Resize_Left))
+	case .New_Workspace:
+		new_workspace(app)
+	case .Close_Workspace:
+		close_workspace(app)
+	case .Next_Workspace:
+		switch_space(app, app.space + 1)
+	case .Prev_Workspace:
+		switch_space(app, app.space - 1)
+	case:
+		return pane_action(app, action)
+	}
+	app.dirty = true
+	return true
+}
+
+pane_action :: proc(app: ^App, action: Action) -> bool {
+	p := focused(app)
 	if p == nil do return false
 	t := p.vt
 	#partial switch action {
@@ -204,15 +244,29 @@ run_action :: proc(app: ^App, action: Action) -> bool {
 	return true
 }
 
-// cell under the mouse, clamped to the pane grid
-mouse_cell :: proc(app: ^App, p: ^Pane) -> (col, row: int) {
+// mouse position in framebuffer pixels
+mouse_px :: proc(app: ^App) -> (x, y: f64) {
 	mx, my := glfw.GetCursorPos(app.win)
 	ww, _ := glfw.GetWindowSize(app.win)
 	fw, _ := glfw.GetFramebufferSize(app.win)
 	k := f64(fw) / f64(max(ww, 1))
-	col = int((mx * k - f64(p.x + PAD)) / f64(app.f.cell_w))
-	row = int((my * k - f64(p.y + PAD)) / f64(app.f.cell_h))
+	return mx * k, my * k
+}
+
+// cell under the mouse, clamped to the pane grid
+mouse_cell :: proc(app: ^App, p: ^Pane) -> (col, row: int) {
+	mx, my := mouse_px(app)
+	col = int((mx - f64(p.x + PAD)) / f64(app.f.cell_w))
+	row = int((my - f64(p.y + PAD)) / f64(app.f.cell_h))
 	return clamp(col, 0, p.vt.cols - 1), clamp(row, 0, p.vt.rows - 1)
+}
+
+// the dragged pane, or the one under the mouse
+mouse_pane :: proc(app: ^App) -> ^Pane {
+	if app.drag != nil do return app.drag
+	mx, my := mouse_px(app)
+	n := pane_at(app, int(mx), int(my))
+	return n.pane if n != nil else nil
 }
 
 reports_mouse :: proc(app: ^App, p: ^Pane) -> bool {
@@ -224,8 +278,19 @@ on_mouse_button :: proc "c" (w: glfw.WindowHandle, button, action, mods: i32) {
 	app := app_of(w)
 	context = app.ctx
 	app.mods = to_mods(mods)
-	p := app.pane
+	mx, my := mouse_px(app)
+	if action == glfw.PRESS && my < f64(bar_height(app)) {
+		for h in app.tab_hits do if f32(mx) >= h.x0 && f32(mx) < h.x1 do switch_tab(app, h.tab)
+		return
+	}
+	p := mouse_pane(app)
 	if p == nil do return
+	if action == glfw.PRESS {
+		focus_node(app, p.node)
+		app.drag = p
+	} else {
+		app.drag = nil
+	}
 	col, row := mouse_cell(app, p)
 	// glfw orders buttons left, right, middle
 	btns := [3]int{0, 2, 1}
@@ -286,7 +351,7 @@ extend_selection :: proc(p: ^Pane, pos: term.Pos) {
 on_cursor_pos :: proc "c" (w: glfw.WindowHandle, x, y: f64) {
 	app := app_of(w)
 	context = app.ctx
-	p := app.pane
+	p := mouse_pane(app)
 	if p == nil do return
 	col, row := mouse_cell(app, p)
 	if reports_mouse(app, p) {
@@ -300,10 +365,10 @@ on_cursor_pos :: proc "c" (w: glfw.WindowHandle, x, y: f64) {
 	}
 	if p.sel.dragging {
 		t := p.vt
-		_, wy := glfw.GetCursorPos(app.win)
+		_, my := mouse_px(app)
 		// drag past the edges scrolls the view
-		if wy < 0 do term.scroll_view(t, 1)
-		if row == t.rows - 1 && wy > f64(p.y + p.h) do term.scroll_view(t, -1)
+		if my < f64(p.y) do term.scroll_view(t, 1)
+		if my > f64(p.y + p.h) do term.scroll_view(t, -1)
 		extend_selection(p, {t.hist.total - t.view + row, col})
 		app.dirty = true
 	}
@@ -312,7 +377,7 @@ on_cursor_pos :: proc "c" (w: glfw.WindowHandle, x, y: f64) {
 on_scroll :: proc "c" (w: glfw.WindowHandle, dx, dy: f64) {
 	app := app_of(w)
 	context = app.ctx
-	p := app.pane
+	p := mouse_pane(app)
 	if p == nil do return
 	app.scroll_acc += dy
 	notches := int(app.scroll_acc)
@@ -333,12 +398,12 @@ on_scroll :: proc "c" (w: glfw.WindowHandle, dx, dy: f64) {
 	if len(out) > 0 do term.pty_write(p.pty, out[:])
 }
 
-on_focus :: proc "c" (w: glfw.WindowHandle, focused: i32) {
+on_focus :: proc "c" (w: glfw.WindowHandle, has_focus: i32) {
 	app := app_of(w)
 	context = app.ctx
-	app.focused = focused != 0
+	app.focused = has_focus != 0
 	app.dirty = true
-	p := app.pane
+	p := focused(app)
 	if p != nil && .Focus_Events in p.vt.modes {
 		term.pty_write(p.pty, transmute([]u8)string("\x1b[I" if app.focused else "\x1b[O"))
 	}
