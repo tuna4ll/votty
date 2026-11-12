@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:time"
 import "term"
 import gl "vendor:OpenGL"
 
@@ -164,7 +165,10 @@ Renderer :: struct {
 	bold_bright: bool,
 	stats:      struct {
 		rows_written: int,
+		full_syncs:   int,
 		frames:       int,
+		cpu:          time.Duration,
+		worst:        time.Duration,
 	},
 }
 
@@ -350,6 +354,7 @@ sync_pane :: proc(r: ^Renderer, g: ^Pane_Gpu, f: ^Fonts, t: ^term.Term) {
 	if g.cols != t.cols || g.rows != t.rows do pane_gpu_alloc(r, g, t.cols, t.rows)
 	gen := f.generation
 	full := t.all_dirty || g.generation != gen || g.view != t.view
+	if full do r.stats.full_syncs += 1
 	s := t.scr
 	g.upload_lo, g.upload_hi = g.rows, 0
 	remap := false
@@ -410,6 +415,13 @@ begin_frame :: proc(r: ^Renderer, w, h: int, bg: u32) {
 	gl.Enable(gl.BLEND)
 	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 	r.stats.frames += 1
+}
+
+print_stats :: proc(r: ^Renderer) {
+	s := r.stats
+	n := max(s.frames, 1)
+	fmt.eprintfln("votty: %d frames, %d rows uploaded (%.1f per frame), %d full syncs, frame cpu avg %v worst %v",
+		s.frames, s.rows_written, f64(s.rows_written) / f64(n), s.full_syncs, s.cpu / time.Duration(n), s.worst)
 }
 
 end_frame :: proc(r: ^Renderer) {

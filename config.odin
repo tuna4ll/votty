@@ -62,6 +62,8 @@ Config :: struct {
 	opacity:       f32,
 	bold_bright:   bool,
 	platform:      string,
+	persistent:    bool,
+	stats:         bool,
 	bindings:      [dynamic]Binding,
 }
 
@@ -188,6 +190,7 @@ config_defaults :: proc(c: ^Config) {
 	c.opacity = 1
 	c.bold_bright = true
 	c.platform = strings.clone("auto")
+	c.persistent = true
 	for d in DEFAULT_BINDINGS {
 		b, _ := parse_keys(d.keys)
 		b.action = d.action
@@ -295,6 +298,10 @@ config_set :: proc(c: ^Config, key, val: string) -> bool {
 		c.opacity = v
 	case key == "bold_is_bright":
 		c.bold_bright = parse_bool(val) or_return
+	case key == "stats":
+		c.stats = parse_bool(val) or_return
+	case key == "persistent_buffers":
+		c.persistent = parse_bool(val) or_return
 	case key == "platform":
 		if val != "auto" && val != "x11" && val != "wayland" do return false
 		delete(c.platform)

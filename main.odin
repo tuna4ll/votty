@@ -319,6 +319,7 @@ draw_cursor :: proc(app: ^App, p: ^Pane, ox, oy: int, focused: bool) {
 }
 
 render :: proc(app: ^App) {
+	start := time.tick_now()
 	w, h := glfw.GetFramebufferSize(app.win)
 	fp := focused(app)
 	bg := fp.vt.bg if fp != nil else app.cfg.bg
@@ -330,6 +331,9 @@ render :: proc(app: ^App) {
 	no_clip(&app.r)
 	draw_tab_bar(app)
 	end_frame(&app.r)
+	el := time.tick_since(start)
+	app.r.stats.cpu += el
+	app.r.stats.worst = max(app.r.stats.worst, el)
 	glfw.SwapBuffers(app.win)
 	app.dirty = false
 	app.last_frame = time.tick_now()
@@ -412,7 +416,7 @@ main :: proc() {
 
 	major := glfw.GetWindowAttrib(app.win, glfw.CONTEXT_VERSION_MAJOR)
 	minor := glfw.GetWindowAttrib(app.win, glfw.CONTEXT_VERSION_MINOR)
-	if !renderer_init(&app.r, major * 10 + minor >= 44) {
+	if !renderer_init(&app.r, app.cfg.persistent && major * 10 + minor >= 44) {
 		os.exit(1)
 	}
 	defer renderer_destroy(&app.r)
@@ -478,4 +482,5 @@ main :: proc() {
 		if app.dirty && time.tick_since(app.last_frame) >= app.frame_time do render(app)
 		free_all(context.temp_allocator)
 	}
+	if app.cfg.stats do print_stats(&app.r)
 }

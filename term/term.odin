@@ -281,18 +281,20 @@ rune_width :: proc(r: rune) -> int {
 @(private)
 history_push :: proc(t: ^Term, cells: []Cell, wrapped: bool) {
 	h := &t.hist
-	cap := len(h.lines)
+	ring := len(h.lines)
 	slot: ^History_Line
-	if h.count < cap {
-		slot = &h.lines[(h.head + h.count) % cap]
+	if h.count < ring {
+		slot = &h.lines[(h.head + h.count) % ring]
 		h.count += 1
 	} else {
 		slot = &h.lines[h.head]
-		h.head = (h.head + 1) % cap
+		h.head = (h.head + 1) % ring
 		graphics_drop_before(t, h.total - h.count + 1)
 	}
 	n := len(cells)
 	for n > 0 && cells[n - 1] == {} do n -= 1
+	// slots keep their capacity so a full ring stops allocating
+	if cap(slot.cells) < n do reserve(&slot.cells, max(n, t.cols))
 	resize(&slot.cells, n)
 	copy(slot.cells[:], cells[:n])
 	slot.wrapped = wrapped
@@ -474,6 +476,45 @@ print :: proc(t: ^Term, ch: rune) {
 	} else {
 		t.cur.x = x + w
 	}
+}
+
+// bulk path for printable ascii runs
+print_ascii :: proc(t: ^Term, s: []u8) {
+	if .Insert in t.modes || t.cur.charset[t.cur.gl] == '0' {
+		for b in s do print(t, rune(b))
+		return
+	}
+	i := 0
+	for i < len(s) {
+		if t.cur.wrap && .Wrap in t.modes {
+			t.scr.wrapped[t.scr.lines[t.cur.y]] = true
+			linefeed(t)
+			t.cur.x = 0
+		}
+		r := row(t, t.cur.y)
+		x := t.cur.x
+		n := min(len(s) - i, t.cols - x)
+		if .Wrap not_in t.modes && n < len(s) - i {
+			// without autowrap the excess lands on the last column
+			i = len(s) - n
+		}
+		fix_wide(t, r, x)
+		fix_wide(t, r, x + n - 1)
+		c := t.cur.pen
+		c.mark = 0
+		for k in 0 ..< n {
+			c.ch = rune(s[i + k])
+			r[x + k] = c
+		}
+		i += n
+		if x + n >= t.cols {
+			t.cur.x = t.cols - 1
+			t.cur.wrap = .Wrap in t.modes
+		} else {
+			t.cur.x = x + n
+		}
+	}
+	t.last_ch = rune(s[len(s) - 1])
 }
 
 @(private)

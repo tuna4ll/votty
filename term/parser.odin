@@ -61,7 +61,10 @@ feed :: proc(t: ^Term, data: []u8) {
 		switch p.state {
 		case .Ground:
 			if b >= 0x20 && b < 0x7f && p.utf_need == 0 {
-				print(t, rune(b))
+				j := i + 1
+				for j < len(data) && data[j] >= 0x20 && data[j] < 0x7f do j += 1
+				print_ascii(t, data[i:j])
+				i = j - 1
 			} else if b >= 0x80 {
 				utf8_byte(t, b)
 			} else {
