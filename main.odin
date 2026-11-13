@@ -2,6 +2,7 @@ package main
 
 import "base:runtime"
 import "core:fmt"
+@(require) import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:sys/posix"
@@ -27,6 +28,7 @@ Pane :: struct {
 	searching:  bool,
 	query:      [dynamic]u8,
 	node:       ^Node,
+	sync_since: time.Tick,
 }
 
 Sel_Mode :: enum u8 {
@@ -171,6 +173,16 @@ pane_pump :: proc(app: ^App, p: ^Pane) -> bool {
 		t.title_dirty = false
 		if p == focused(app) do update_title(app)
 		app.dirty = true
+	}
+	if t.bell {
+		t.bell = false
+		if !app.focused do glfw.RequestWindowAttention(app.win)
+	}
+	// hold frames while an app batches an update, with a timeout
+	if .Sync_Output in t.modes {
+		if p.sync_since == {} do p.sync_since = time.tick_now()
+	} else {
+		p.sync_since = {}
 	}
 	if t.clip_dirty {
 		t.clip_dirty = false
@@ -318,6 +330,16 @@ draw_cursor :: proc(app: ^App, p: ^Pane, ox, oy: int, focused: bool) {
 	}
 }
 
+syncing :: proc(app: ^App) -> bool {
+	t := cur_tab(app)
+	if t == nil do return false
+	for n in tab_panes(t) {
+		p := n.pane
+		if p.sync_since != {} && time.tick_since(p.sync_since) < 150 * time.Millisecond do return true
+	}
+	return false
+}
+
 render :: proc(app: ^App) {
 	start := time.tick_now()
 	w, h := glfw.GetFramebufferSize(app.win)
@@ -345,6 +367,16 @@ usage :: proc() {
 }
 
 main :: proc() {
+	when ODIN_DEBUG {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		context.allocator = mem.tracking_allocator(&track)
+		defer {
+			for _, leak in track.allocation_map do fmt.eprintfln("votty: leaked %v bytes at %v", leak.size, leak.location)
+			for bad in track.bad_free_array do fmt.eprintfln("votty: bad free at %v", bad.location)
+			mem.tracking_allocator_destroy(&track)
+		}
+	}
 	app := new(App)
 	defer free(app)
 	app.ctx = context
@@ -458,6 +490,7 @@ main :: proc() {
 	for !glfw.WindowShouldClose(app.win) {
 		if app.dirty {
 			wait := app.frame_time - time.tick_since(app.last_frame)
+			if syncing(app) do wait = max(wait, 5 * time.Millisecond)
 			if wait > 0 {
 				glfw.WaitEventsTimeout(time.duration_seconds(wait))
 			} else {
@@ -479,7 +512,7 @@ main :: proc() {
 			pane_search_tick(app, p)
 		}
 		if len(app.spaces) == 0 do break
-		if app.dirty && time.tick_since(app.last_frame) >= app.frame_time do render(app)
+		if app.dirty && time.tick_since(app.last_frame) >= app.frame_time && !syncing(app) do render(app)
 		free_all(context.temp_allocator)
 	}
 	if app.cfg.stats do print_stats(&app.r)

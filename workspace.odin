@@ -206,6 +206,7 @@ remove_pane :: proc(app: ^App, p: ^Pane) {
 				}
 			}
 			if len(ws.tabs) == 0 {
+				delete(ws.tabs)
 				free(ws)
 				ordered_remove(&app.spaces, wi)
 				app.space = clamp(app.space, 0, max(len(app.spaces) - 1, 0))
