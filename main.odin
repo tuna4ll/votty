@@ -70,6 +70,8 @@ App :: struct {
 	click_time:  f64,
 	click_pos:   term.Pos,
 	scroll_acc:  f64,
+	mouse_x:     f64,
+	mouse_y:     f64,
 }
 
 theme_of :: proc(c: ^Config) -> (th: term.Theme) {

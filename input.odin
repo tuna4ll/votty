@@ -246,7 +246,7 @@ pane_action :: proc(app: ^App, action: Action) -> bool {
 
 // mouse position in framebuffer pixels
 mouse_px :: proc(app: ^App) -> (x, y: f64) {
-	mx, my := glfw.GetCursorPos(app.win)
+	mx, my := app.mouse_x, app.mouse_y
 	ww, _ := glfw.GetWindowSize(app.win)
 	fw, _ := glfw.GetFramebufferSize(app.win)
 	k := f64(fw) / f64(max(ww, 1))
@@ -351,6 +351,7 @@ extend_selection :: proc(p: ^Pane, pos: term.Pos) {
 on_cursor_pos :: proc "c" (w: glfw.WindowHandle, x, y: f64) {
 	app := app_of(w)
 	context = app.ctx
+	app.mouse_x, app.mouse_y = x, y
 	p := mouse_pane(app)
 	if p == nil do return
 	col, row := mouse_cell(app, p)
