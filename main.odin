@@ -202,7 +202,7 @@ draw_pane :: proc(app: ^App, p: ^Pane, focused: bool) {
 	ox, oy := p.x + PAD, p.y + PAD
 	clip(r, p.x, p.y, p.w, p.h)
 	push_rect(r, f32(p.x), f32(p.y), f32(p.w), f32(p.h), pack(t.bg, r.opacity))
-	flush_rects(r, .Solid)
+	flush_rects(r, .Solid, replace = true)
 	release_textures(r, &t.gfx)
 	draw_grid(r, &p.gpu, f, ox, oy, 0)
 	draw_images(r, f, t, ox, oy, true)

@@ -52,7 +52,7 @@ uniform float u_strike;
 out vec4 color;
 void main() {
 	if (u_pass == 0) {
-		color = v_bg;
+		color = vec4(v_bg.rgb * v_bg.a, v_bg.a);
 		return;
 	}
 	float a = 0.0;
@@ -73,7 +73,8 @@ void main() {
 	if ((v_flags & 8u) != 0u && y >= u_strike && y < u_strike + u_thick) a = 1.0;
 	if ((v_flags & 16u) != 0u && y < u_thick) a = 1.0;
 	if (a <= 0.0) discard;
-	color = vec4(v_fg.rgb, v_fg.a * a);
+	a *= v_fg.a;
+	color = vec4(v_fg.rgb * a, a);
 }
 `
 
@@ -101,14 +102,16 @@ uniform sampler2D u_tex;
 uniform int u_mode;
 out vec4 color;
 void main() {
+	// all outputs are premultiplied
 	if (u_mode == 0) {
-		color = v_color;
+		color = vec4(v_color.rgb * v_color.a, v_color.a);
 	} else if (u_mode == 1) {
-		float a = texelFetch(u_tex, ivec2(v_uv), 0).r;
+		float a = texelFetch(u_tex, ivec2(v_uv), 0).r * v_color.a;
 		if (a <= 0.0) discard;
-		color = vec4(v_color.rgb, v_color.a * a);
+		color = vec4(v_color.rgb * a, a);
 	} else {
-		color = texture(u_tex, v_uv) * v_color.a;
+		vec4 t = texture(u_tex, v_uv);
+		color = vec4(t.rgb * t.a, t.a) * v_color.a;
 	}
 }
 `
@@ -409,11 +412,11 @@ begin_frame :: proc(r: ^Renderer, w, h: int, bg: u32) {
 	}
 	gl.Viewport(0, 0, i32(w), i32(h))
 	gl.Disable(gl.SCISSOR_TEST)
-	c := pack(bg, r.opacity)
-	gl.ClearColor(f32(c & 0xff) / 255, f32((c >> 8) & 0xff) / 255, f32((c >> 16) & 0xff) / 255, r.opacity)
+	a := r.opacity
+	gl.ClearColor(f32((bg >> 16) & 0xff) / 255 * a, f32((bg >> 8) & 0xff) / 255 * a, f32(bg & 0xff) / 255 * a, a)
 	gl.Clear(gl.COLOR_BUFFER_BIT)
 	gl.Enable(gl.BLEND)
-	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+	gl.BlendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
 	r.stats.frames += 1
 }
 
@@ -452,7 +455,10 @@ draw_grid :: proc(r: ^Renderer, g: ^Pane_Gpu, f: ^Fonts, x, y: int, pass: i32) {
 	gl.ActiveTexture(gl.TEXTURE0)
 	gl.BindTexture(gl.TEXTURE_2D, f.tex)
 	gl.BindVertexArray(g.vao)
+	// backgrounds replace what is below so translucent cells keep their alpha
+	if pass == 0 do gl.Disable(gl.BLEND)
 	gl.DrawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, i32(g.cols * g.rows))
+	if pass == 0 do gl.Enable(gl.BLEND)
 }
 
 push_rect :: proc(r: ^Renderer, x, y, w, h: f32, color: u32) {
@@ -468,8 +474,8 @@ push_glyph :: proc(r: ^Renderer, f: ^Fonts, x, y: f32, slot: u32, wide: bool, co
 	append(&r.rects, Rect{x, y, w, h, sx, sy, sx + w, sy + h, color})
 }
 
-// draws pending rects with one texture binding and mode
-flush_rects :: proc(r: ^Renderer, mode: Rect_Mode, tex: u32 = 0) {
+// draws pending rects with one texture binding and mode; opaque rects replace the destination
+flush_rects :: proc(r: ^Renderer, mode: Rect_Mode, tex: u32 = 0, replace := false) {
 	if len(r.rects) == 0 do return
 	gl.UseProgram(r.rect)
 	gl.Uniform2f(r.rect_u.screen, f32(r.fb_w), f32(r.fb_h))
@@ -484,7 +490,9 @@ flush_rects :: proc(r: ^Renderer, mode: Rect_Mode, tex: u32 = 0) {
 	// orphan so the driver does not stall on the previous draw
 	gl.BufferData(gl.ARRAY_BUFFER, r.rect_cap, nil, gl.STREAM_DRAW)
 	gl.BufferSubData(gl.ARRAY_BUFFER, 0, size, raw_data(r.rects))
+	if replace do gl.Disable(gl.BLEND)
 	gl.DrawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, i32(len(r.rects)))
+	if replace do gl.Enable(gl.BLEND)
 	clear(&r.rects)
 }
 
