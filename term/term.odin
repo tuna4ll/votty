@@ -671,6 +671,11 @@ resize_term :: proc(t: ^Term, new_cols, new_rows: int) {
 	cols, rows := max(new_cols, 1), max(new_rows, 1)
 	if cols == t.cols && rows == t.rows do return
 	on_alt := t.scr == &t.alt
+	if cols != t.cols {
+		delta := reflow_primary(t, cols, rows, on_alt)
+		resize_alt(t, cols, rows, on_alt, delta)
+		return
+	}
 
 	// keep the cursor row on screen by pushing lines into history
 	cy := t.primary.saved.y if on_alt else t.cur.y
@@ -708,7 +713,18 @@ resize_term :: proc(t: ^Term, new_cols, new_rows: int) {
 	np.saved = t.primary.saved
 	screen_free(&t.primary)
 	t.primary = np
+	if on_alt {
+		t.primary.saved.y = clamp(t.primary.saved.y - shift + pull, 0, rows - 1)
+	} else {
+		t.cur.y = t.cur.y - shift + pull
+		t.primary.saved.y = clamp(t.primary.saved.y - shift + pull, 0, rows - 1)
+	}
+	resize_alt(t, cols, rows, on_alt, shift - pull)
+}
 
+// resizes the alternate screen and finishes a resize; delta is how far the primary base line moved
+@(private)
+resize_alt :: proc(t: ^Term, cols, rows: int, on_alt: bool, delta: int) {
 	na: Screen
 	screen_init(&na, cols, rows)
 	ashift := max(t.cur.y - rows + 1, 0) if on_alt else 0
@@ -721,15 +737,8 @@ resize_term :: proc(t: ^Term, new_cols, new_rows: int) {
 	screen_free(&t.alt)
 	t.alt = na
 	t.scr = &t.alt if on_alt else &t.primary
-	graphics_resize(t, shift - pull - ashift)
-
-	if on_alt {
-		t.cur.y -= ashift
-		t.primary.saved.y = clamp(t.primary.saved.y - shift + pull, 0, rows - 1)
-	} else {
-		t.cur.y = t.cur.y - shift + pull
-		t.primary.saved.y = clamp(t.primary.saved.y - shift + pull, 0, rows - 1)
-	}
+	graphics_resize(t, delta - ashift)
+	if on_alt do t.cur.y -= ashift
 
 	delete(t.tabs)
 	t.tabs = make([]bool, cols)
@@ -747,6 +756,139 @@ resize_term :: proc(t: ^Term, new_cols, new_rows: int) {
 	t.view = min(t.view, t.hist.count)
 	t.all_dirty = true
 	t.output_seq += 1
+}
+
+// rewraps history and the primary screen at a new width; returns how far the screen base line moved
+@(private)
+reflow_primary :: proc(t: ^Term, cols, rows: int, on_alt: bool) -> int {
+	Row :: struct {
+		start, n: int,
+		wrapped:  bool,
+		off:      int, // offset of the row inside its logical line
+	}
+	Old_Pos :: struct {
+		line, off: int,
+	}
+	h := &t.hist
+	cx, cy := t.cur.x, t.cur.y
+	if on_alt do cx, cy = t.primary.saved.x, t.primary.saved.y
+	first := h.total - h.count
+	last := cy
+	for y in cy + 1 ..< t.rows {
+		for c in screen_row(t, &t.primary, y) do if c != {} do last = y
+	}
+	end_abs := h.total + last
+
+	// flatten everything into logical lines
+	cells := make([dynamic]Cell, context.temp_allocator)
+	starts := make([dynamic]int, context.temp_allocator)
+	old_pos := make([]Old_Pos, end_abs - first + 1, context.temp_allocator)
+	cur := Old_Pos{}
+	open := false
+	for abs in first ..= end_abs {
+		src: []Cell
+		wrapped: bool
+		if abs < h.total {
+			l := &h.lines[(h.head + abs - first) % len(h.lines)]
+			src, wrapped = l.cells[:], l.wrapped
+		} else {
+			p := t.primary.lines[abs - h.total]
+			src, wrapped = t.primary.cells[p * t.cols:(p + 1) * t.cols], t.primary.wrapped[p]
+		}
+		if abs == end_abs do wrapped = false
+		if !open do append(&starts, len(cells))
+		li := len(starts) - 1
+		off := len(cells) - starts[li]
+		old_pos[abs - first] = {li, off}
+		if abs == h.total + cy do cur = {li, off + cx}
+		// untouched cells at the end of a row are padding, even on wrapped rows
+		n := min(len(src), t.cols)
+		for n > 0 && src[n - 1] == {} do n -= 1
+		append(&cells, ..src[:n])
+		open = wrapped
+	}
+	nlines := len(starts)
+	append(&starts, len(cells))
+
+	out := make([dynamic]Row, context.temp_allocator)
+	line_row := make([]int, nlines + 1, context.temp_allocator)
+	for li in 0 ..< nlines {
+		a, b := starts[li], starts[li + 1]
+		line_row[li] = len(out)
+		i := a
+		for {
+			n := min(cols, b - i)
+			// a wide char never splits across rows
+			if n == cols && n > 1 && .Wide in cells[i + n - 1].attrs do n -= 1
+			append(&out, Row{i, n, i + n < b, i - a})
+			i += n
+			if i >= b || n == 0 do break
+		}
+	}
+	line_row[nlines] = len(out)
+	locate :: proc(out: []Row, line_row: []int, p: Old_Pos) -> (row, col: int) {
+		r := line_row[p.line]
+		for r + 1 < line_row[p.line + 1] && out[r + 1].off <= p.off do r += 1
+		return r, p.off - out[r].off
+	}
+
+	crow, ccol := locate(out[:], line_row, cur)
+	n := len(out)
+	top := max(0, max(n, crow + 1) - rows)
+	np: Screen
+	screen_init(&np, cols, rows)
+	for i in top ..< n {
+		y := i - top
+		if y >= rows do break
+		r := out[i]
+		copy(np.cells[y * cols:y * cols + r.n], cells[r.start:r.start + r.n])
+		np.wrapped[y] = r.wrapped
+	}
+	np.saved = t.primary.saved
+	np.saved.x = clamp(np.saved.x, 0, cols - 1)
+	np.saved.y = clamp(np.saved.y, 0, rows - 1)
+
+	// rows above the screen become history, oldest dropped first
+	keep := min(top, len(h.lines))
+	from := top - keep
+	for k in 0 ..< keep {
+		r := out[from + k]
+		slot := &h.lines[k]
+		resize(&slot.cells, r.n)
+		copy(slot.cells[:], cells[r.start:r.start + r.n])
+		slot.wrapped = r.wrapped
+	}
+	old_total := h.total
+	h.head = 0
+	h.count = keep
+	h.total = first + top
+
+	// primary placements follow the text they were anchored to
+	g := &t.gfx
+	#reverse for &pl, i in g.placements {
+		if pl.alt do continue
+		k := pl.line - first
+		if k >= 0 && k < len(old_pos) {
+			row, _ := locate(out[:], line_row, old_pos[k])
+			pl.line = first + row
+		} else if k >= len(old_pos) {
+			pl.line = first + n + (k - len(old_pos))
+		}
+		if pl.line < h.total - h.count do ordered_remove(&g.placements, i)
+		g.changed = true
+	}
+
+	screen_free(&t.primary)
+	t.primary = np
+	y := crow - top
+	x := min(ccol, cols - 1)
+	if on_alt {
+		t.primary.saved.x, t.primary.saved.y = x, y
+	} else {
+		t.cur.x, t.cur.y = x, y
+	}
+	t.view = 0
+	return h.total - old_total
 }
 
 @(private)

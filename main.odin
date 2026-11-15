@@ -135,6 +135,12 @@ pane_layout :: proc(app: ^App, p: ^Pane, x, y, w, h: int) {
 	rows := max((h - 2 * PAD) / app.f.cell_h, 1)
 	term.set_cell_size(p.vt, app.f.cell_w, app.f.cell_h)
 	if cols != p.vt.cols || rows != p.vt.rows {
+		// reflow renumbers lines, so positions into them go stale
+		if cols != p.vt.cols {
+			p.sel.active = false
+			p.search.found = false
+			if p.searching do restart_search(p)
+		}
 		term.resize_term(p.vt, cols, rows)
 		term.pty_resize(p.pty, {u16(rows), u16(cols), u16(cols * app.f.cell_w), u16(rows * app.f.cell_h)})
 	}
