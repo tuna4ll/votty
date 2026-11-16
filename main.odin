@@ -224,12 +224,13 @@ draw_matches :: proc(app: ^App, p: ^Pane, ox, oy: int) {
 	t := p.vt
 	top := t.hist.total - t.view
 	ms := make([dynamic]term.Match, context.temp_allocator)
-	for l in top ..< top + t.rows do term.line_matches(t, &p.search, l, &ms)
+	// a match from the row above may wrap into view
+	for l in top - 1 ..< top + t.rows do term.line_matches(t, &p.search, l, &ms)
 	cur := p.search.current
 	for m in ms {
 		is_cur := p.search.found && m == cur
 		color := pack(0xe0a030, 0.9) if is_cur else pack(0x807020, 0.6)
-		highlight(app, p, ox, oy, {m.line, m.col}, {m.line, m.col + m.len - 1}, color)
+		highlight(app, p, ox, oy, {m.line, m.col}, {m.end_line, m.end_col}, color)
 	}
 	flush_rects(&app.r, .Solid)
 }

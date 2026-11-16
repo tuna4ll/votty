@@ -2,10 +2,10 @@ package term
 
 import "core:unicode"
 
+// inclusive span; a match may continue across soft wrapped rows
 Match :: struct {
-	line: int,
-	col:  int, // first cell
-	len:  int, // cells covered
+	line, col:         int,
+	end_line, end_col: int,
 }
 
 Search :: struct {
@@ -37,36 +37,46 @@ fold :: #force_inline proc(r: rune, sensitive: bool) -> rune {
 	return unicode.to_lower(r)
 }
 
-// length in cells of a match of q starting at x, or 0
+// end of a match of q starting at line, x
 @(private)
-match_at :: proc(cells: []Cell, x: int, q: []rune, sensitive: bool) -> int {
+match_at :: proc(t: ^Term, cells: []Cell, wrapped: bool, line, x: int, q: []rune, sensitive: bool) -> (end: Pos, ok: bool) {
+	cells, wrapped, l := cells, wrapped, line
 	i, cx := 0, x
 	for i < len(q) {
-		if cx >= len(cells) do return 0
+		if cx >= len(cells) {
+			if !wrapped do return
+			l += 1
+			cells, wrapped = get_line(t, l) or_return
+			cx = 0
+			continue
+		}
 		c := cells[cx]
 		if .Spacer in c.attrs {
 			cx += 1
 			continue
 		}
-		if fold(c.ch, sensitive) != q[i] do return 0
+		if fold(c.ch, sensitive) != q[i] do return
+		end = {l, cx}
 		i += 1
 		cx += 1
 	}
 	// cover the trailing spacer of a wide char
-	if cx < len(cells) && .Spacer in cells[cx].attrs do cx += 1
-	return cx - x
+	if cx < len(cells) && .Spacer in cells[cx].attrs do end.col = cx
+	return end, true
 }
 
-// appends every match on an absolute line, overlapping ones included
+// appends every match starting on an absolute line, overlapping ones included
 line_matches :: proc(t: ^Term, s: ^Search, line: int, out: ^[dynamic]Match) {
 	if len(s.query) == 0 do return
-	cells, _, ok := get_line(t, line)
+	cells, wrapped, ok := get_line(t, line)
 	if !ok do return
 	first := s.query[0]
 	for x in 0 ..< len(cells) {
 		c := cells[x]
 		if .Spacer in c.attrs || fold(c.ch, s.case_sensitive) != first do continue
-		if n := match_at(cells, x, s.query[:], s.case_sensitive); n > 0 do append(out, Match{line, x, n})
+		if end, mok := match_at(t, cells, wrapped, line, x, s.query[:], s.case_sensitive); mok {
+			append(out, Match{line, x, end.line, end.col})
+		}
 	}
 }
 
