@@ -50,6 +50,7 @@ Binding :: struct {
 Config :: struct {
 	font:          string,
 	font_size:     f32,
+	font_weight:   string,
 	shell:         string,
 	scrollback:    int,
 	width, height: int, // cells
@@ -200,6 +201,7 @@ config_defaults :: proc(c: ^Config) {
 
 config_destroy :: proc(c: ^Config) {
 	delete(c.font)
+	delete(c.font_weight)
 	delete(c.shell)
 	delete(c.platform)
 	delete(c.bindings)
@@ -254,6 +256,11 @@ config_set :: proc(c: ^Config, key, val: string) -> bool {
 		if val == "" do return false
 		delete(c.font)
 		c.font = strings.clone(val)
+	case key == "font_weight":
+		// fontconfig names like light, regular, medium, semibold or a number
+		for ch in val do if !(ch >= 'a' && ch <= 'z') && !(ch >= '0' && ch <= '9') do return false
+		delete(c.font_weight)
+		c.font_weight = strings.clone(val)
 	case key == "font_size":
 		v, ok := strconv.parse_f32(val)
 		if !ok || v < 4 || v > 200 do return false

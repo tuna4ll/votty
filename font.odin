@@ -119,12 +119,13 @@ free_face :: proc(f: ^Face) {
 	free(f)
 }
 
-fonts_init :: proc(f: ^Fonts, family: string, size: f32, dpi_scale: f32) -> bool {
+fonts_init :: proc(f: ^Fonts, family: string, size: f32, dpi_scale: f32, weight := "") -> bool {
 	FcInit()
 	f.family = family
 	f.size = size
+	regular := family if weight == "" else strings.concatenate({family, ":weight=", weight}, context.temp_allocator)
 	queries := [Style]string {
-		.Regular     = family,
+		.Regular     = regular,
 		.Bold        = strings.concatenate({family, ":weight=bold"}, context.temp_allocator),
 		.Italic      = strings.concatenate({family, ":slant=italic"}, context.temp_allocator),
 		.Bold_Italic = strings.concatenate({family, ":weight=bold:slant=italic"}, context.temp_allocator),
