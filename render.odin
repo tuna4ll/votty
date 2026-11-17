@@ -353,7 +353,7 @@ write_row :: proc(r: ^Renderer, g: ^Pane_Gpu, f: ^Fonts, t: ^term.Term, slot: in
 }
 
 // brings the gpu copy of a terminal up to date, touching only dirty rows
-sync_pane :: proc(r: ^Renderer, g: ^Pane_Gpu, f: ^Fonts, t: ^term.Term) {
+sync_pane :: proc(r: ^Renderer, g: ^Pane_Gpu, f: ^Fonts, t: ^term.Term, retry := true) {
 	if g.cols != t.cols || g.rows != t.rows do pane_gpu_alloc(r, g, t.cols, t.rows)
 	gen := f.generation
 	full := t.all_dirty || g.generation != gen || g.view != t.view
@@ -380,11 +380,14 @@ sync_pane :: proc(r: ^Renderer, g: ^Pane_Gpu, f: ^Fonts, t: ^term.Term) {
 			remap = true
 		}
 	}
-	// the atlas may have been reset while rows were written
-	if f.generation != gen {
-		sync_pane(r, g, f, t)
+	// the atlas may have been reset while rows were written; a screen needing more
+	// glyphs than the atlas holds keeps whatever the second pass managed
+	if f.generation != gen && retry {
+		t.all_dirty = true
+		sync_pane(r, g, f, t, false)
 		return
 	}
+	gen = f.generation
 	for &d in s.dirty do d = false
 	s.remapped = false
 	t.all_dirty = false
