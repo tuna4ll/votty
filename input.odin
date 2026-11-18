@@ -328,6 +328,15 @@ on_mouse_button :: proc "c" (w: glfw.WindowHandle, button, action, mods: i32) {
 		}
 	case 1:
 		if action == glfw.PRESS do paste(app, p)
+	case 2:
+		// right click copies a selection, or pastes when there is none
+		if action != glfw.PRESS do break
+		if p.sel.active {
+			copy_selection(app, p)
+			p.sel.active = false
+		} else {
+			paste(app, p)
+		}
 	}
 	app.dirty = true
 }
