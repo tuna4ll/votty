@@ -53,6 +53,9 @@ App :: struct {
 	spaces:      [dynamic]^Workspace,
 	space:       int,
 	drag:        ^Pane, // pane receiving a mouse drag
+	drag_split:  ^Node, // split whose divider is being dragged
+	cursors:     [3]glfw.CursorHandle, // arrow, horizontal, vertical resize
+	cursor_kind: int,
 	tab_hits:    [dynamic]Tab_Hit,
 	dirty:       bool,
 	scale:       f32,
@@ -484,6 +487,12 @@ main :: proc() {
 			app.frame_time = time.Second / time.Duration(mode.refresh_rate)
 		}
 	}
+	app.cursors = {
+		glfw.CreateStandardCursor(glfw.ARROW_CURSOR),
+		glfw.CreateStandardCursor(glfw.HRESIZE_CURSOR),
+		glfw.CreateStandardCursor(glfw.VRESIZE_CURSOR),
+	}
+	defer for c in app.cursors do if c != nil do glfw.DestroyCursor(c)
 	install_callbacks(app)
 	if !new_workspace(app) do os.exit(1)
 	defer {

@@ -283,6 +283,16 @@ on_mouse_button :: proc "c" (w: glfw.WindowHandle, button, action, mods: i32) {
 		for h in app.tab_hits do if f32(mx) >= h.x0 && f32(mx) < h.x1 do switch_tab(app, h.tab)
 		return
 	}
+	if action == glfw.PRESS && button == glfw.MOUSE_BUTTON_LEFT {
+		if n := divider_at(app, int(mx), int(my)); n != nil {
+			app.drag_split = n
+			return
+		}
+	}
+	if app.drag_split != nil && action == glfw.RELEASE {
+		app.drag_split = nil
+		return
+	}
 	p := mouse_pane(app)
 	if p == nil do return
 	if action == glfw.PRESS {
@@ -361,6 +371,19 @@ on_cursor_pos :: proc "c" (w: glfw.WindowHandle, x, y: f64) {
 	app := app_of(w)
 	context = app.ctx
 	app.mouse_x, app.mouse_y = x, y
+	mx, my := mouse_px(app)
+	if app.drag_split != nil {
+		drag_divider(app, app.drag_split, int(mx), int(my))
+		return
+	}
+	kind := 0
+	if app.drag == nil {
+		if n := divider_at(app, int(mx), int(my)); n != nil do kind = 2 if n.stack else 1
+	}
+	if kind != app.cursor_kind {
+		app.cursor_kind = kind
+		glfw.SetCursor(app.win, app.cursors[kind])
+	}
 	p := mouse_pane(app)
 	if p == nil do return
 	col, row := mouse_cell(app, p)
@@ -375,7 +398,6 @@ on_cursor_pos :: proc "c" (w: glfw.WindowHandle, x, y: f64) {
 	}
 	if p.sel.dragging {
 		t := p.vt
-		_, my := mouse_px(app)
 		// drag past the edges scrolls the view
 		if my < f64(p.y) do term.scroll_view(t, 1)
 		if my > f64(p.y + p.h) do term.scroll_view(t, -1)

@@ -212,6 +212,7 @@ remove_pane :: proc(app: ^App, p: ^Pane) {
 				app.space = clamp(app.space, 0, max(len(app.spaces) - 1, 0))
 			}
 			if app.drag == p do app.drag = nil
+			app.drag_split = nil
 			pane_close(app, p)
 			free(n)
 			layout(app)
@@ -406,4 +407,31 @@ draw_borders :: proc(app: ^App) {
 	push_rect(r, f32(f.x), f32(f.y), 1, f32(f.h), c)
 	push_rect(r, f32(f.x + f.w - 1), f32(f.y), 1, f32(f.h), c)
 	flush_rects(r, .Solid)
+}
+
+// the split whose divider is under x, y; the gap is widened a little to be grabbable
+divider_at :: proc(app: ^App, x, y: int) -> ^Node {
+	t := cur_tab(app)
+	if t == nil do return nil
+	hit :: proc(n: ^Node, x, y: int) -> ^Node {
+		if n == nil || n.pane != nil do return nil
+		a, b := n.kids[0], n.kids[1]
+		SLOP :: 3
+		if n.stack {
+			if x >= n.x && x < n.x + n.w && y >= a.y + a.h - SLOP && y < b.y + SLOP do return n
+		} else {
+			if y >= n.y && y < n.y + n.h && x >= a.x + a.w - SLOP && x < b.x + SLOP do return n
+		}
+		if r := hit(a, x, y); r != nil do return r
+		return hit(b, x, y)
+	}
+	return hit(t.root, x, y)
+}
+
+drag_divider :: proc(app: ^App, n: ^Node, x, y: int) {
+	r := f32(x - n.x) / f32(max(n.w - GAP, 1)) if !n.stack else f32(y - n.y) / f32(max(n.h - GAP, 1))
+	r = clamp(r, 0.1, 0.9)
+	if r == n.ratio do return
+	n.ratio = r
+	layout(app)
 }
