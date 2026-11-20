@@ -72,12 +72,42 @@ Graphics :: struct {
 	clock:      u64,
 	dropped:    [dynamic]u64, // serials whose textures can go
 	changed:    bool,
+	budget:     ^Image_Budget,
+	own:        Image_Budget, // used when no shared budget is given
 }
 
-@(private)
-serial_counter: u64
+// image memory shared by every terminal that points at it
+Image_Budget :: struct {
+	limit:   int,
+	used:    int,
+	clock:   u64,
+	serial:  u64,
+	members: [dynamic]^Graphics,
+}
+
+budget_join :: proc(b: ^Image_Budget, g: ^Graphics) {
+	g.budget = b
+	append(&b.members, g)
+}
+
+budget_leave :: proc(g: ^Graphics) {
+	b := g.budget
+	if b == nil do return
+	for m, i in b.members do if m == g {
+		unordered_remove(&b.members, i)
+		break
+	}
+	b.used -= g.bytes
+	g.budget = nil
+}
+
+budget_destroy :: proc(b: ^Image_Budget) {
+	delete(b.members)
+}
 
 graphics_free :: proc(g: ^Graphics) {
+	budget_leave(g)
+	budget_destroy(&g.own)
 	for img in g.images {
 		delete(img.rgba)
 		free(img)
@@ -103,6 +133,7 @@ find_number :: proc(g: ^Graphics, n: u32) -> ^Image {
 drop_image :: proc(g: ^Graphics, i: int) {
 	img := g.images[i]
 	g.bytes -= len(img.rgba)
+	g.budget.used -= len(img.rgba)
 	append(&g.dropped, img.serial)
 	delete(img.rgba)
 	free(img)
@@ -326,26 +357,27 @@ finish_transmit :: proc(t: ^Term, c: Gfx_Cmd) {
 		c.id = g.next_id | 0x80000000 if c.number != 0 else 0
 	}
 	if old := find_image(g, c.id); old != nil && c.id != 0 {
-		g.bytes -= len(old.rgba)
+		account(g, len(rgba) - len(old.rgba))
 		append(&g.dropped, old.serial)
 		delete(old.rgba)
 		old.rgba = rgba
 		old.w, old.h = w, h
-		serial_counter += 1
-		old.serial = serial_counter
+		g.budget.serial += 1
+		old.serial = g.budget.serial
 		old.number = c.number
-		g.bytes += len(rgba)
+		g.budget.clock += 1
+		old.used = g.budget.clock
 	} else {
 		img := new(Image)
 		img^ = {id = c.id, number = c.number, w = w, h = h, rgba = rgba}
-		serial_counter += 1
-		img.serial = serial_counter
-		g.clock += 1
-		img.used = g.clock
+		g.budget.serial += 1
+		img.serial = g.budget.serial
+		g.budget.clock += 1
+		img.used = g.budget.clock
 		append(&g.images, img)
-		g.bytes += len(rgba)
+		account(g, len(rgba))
 	}
-	enforce_quota(g)
+	enforce_quota(g.budget)
 	g.changed = true
 	img := find_image(g, c.id)
 	if c.action == 'T' && img != nil do place(t, img, c)
@@ -415,23 +447,38 @@ decode_pixels :: proc(cmd: Gfx_Cmd, data: []u8) -> (rgba: []u8, w, h: int, err: 
 	return nil, 0, 0, "EINVAL:unknown format"
 }
 
-// evicts the oldest unplaced images first, then the oldest overall
 @(private)
-enforce_quota :: proc(g: ^Graphics) {
-	for g.bytes > IMAGE_QUOTA && len(g.images) > 1 {
+account :: proc(g: ^Graphics, n: int) {
+	g.bytes += n
+	g.budget.used += n
+}
+
+// evicts the oldest unplaced image across all terminals first, then the oldest overall;
+// the image just stored is kept as long as anything else can go
+@(private)
+enforce_quota :: proc(b: ^Image_Budget) {
+	for b.used > b.limit {
+		victim_g: ^Graphics
 		victim := -1
-		for img, i in g.images {
-			if !image_used(g, img.id) {
-				victim = i
-				break
+		best_unused, best_any := max(u64), max(u64)
+		any_g: ^Graphics
+		any_i := -1
+		for g in b.members {
+			for img, i in g.images {
+				if img.used == b.clock do continue
+				if !image_used(g, img.id) && img.used < best_unused {
+					best_unused, victim_g, victim = img.used, g, i
+				}
+				if img.used < best_any do best_any, any_g, any_i = img.used, g, i
 			}
 		}
 		if victim < 0 {
-			victim = 0
-			id := g.images[0].id
-			#reverse for p, i in g.placements do if p.image == id do ordered_remove(&g.placements, i)
+			if any_i < 0 do return
+			victim_g, victim = any_g, any_i
+			id := victim_g.images[victim].id
+			#reverse for p, i in victim_g.placements do if p.image == id do ordered_remove(&victim_g.placements, i)
 		}
-		drop_image(g, victim)
+		drop_image(victim_g, victim)
 	}
 }
 

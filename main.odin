@@ -66,6 +66,7 @@ App :: struct {
 	shell:       string,
 	command:     []string,
 	cfg:         Config,
+	images:      term.Image_Budget,
 	last_frame:  time.Tick,
 	frame_time:  time.Duration,
 	focused:     bool,
@@ -102,7 +103,7 @@ default_shell :: proc() -> string {
 
 pane_open :: proc(app: ^App, cols, rows: int, cwd: string = "") -> ^Pane {
 	p := new(Pane)
-	p.vt = term.make_term(cols, rows, app.cfg.scrollback)
+	p.vt = term.make_term(cols, rows, app.cfg.scrollback, &app.images)
 	term.set_cell_size(p.vt, app.f.cell_w, app.f.cell_h)
 	term.set_theme(p.vt, theme_of(&app.cfg))
 	env := []string{"TERM=xterm-256color", "COLORTERM=truecolor", "TERM_PROGRAM=votty"}
@@ -212,7 +213,6 @@ draw_pane :: proc(app: ^App, p: ^Pane, focused: bool) {
 	clip(r, p.x, p.y, p.w, p.h)
 	push_rect(r, f32(p.x), f32(p.y), f32(p.w), f32(p.h), pack(t.bg, r.opacity))
 	flush_rects(r, .Solid, replace = true)
-	release_textures(r, &t.gfx)
 	draw_grid(r, &p.gpu, f, ox, oy, 0)
 	draw_images(r, f, t, ox, oy, true)
 	draw_selection(app, p, ox, oy)
@@ -418,12 +418,14 @@ main :: proc() {
 		}
 	}
 	config_load(&app.cfg, cfg_file)
+	defer term.budget_destroy(&app.images)
 	for o in overrides {
 		eq := strings.index_byte(o, '=')
 		if eq < 0 || !config_set(&app.cfg, strings.trim_space(o[:eq]), strings.trim_space(o[eq + 1:])) {
 			fmt.eprintln("votty: invalid option", o)
 		}
 	}
+	app.images.limit = app.cfg.image_memory
 	app.shell = strings.clone(app.cfg.shell) if app.cfg.shell != "" else default_shell()
 	defer delete(app.shell)
 
@@ -528,6 +530,8 @@ main :: proc() {
 				continue
 			}
 			pane_search_tick(app, p)
+			// evictions can hit panes that are not on screen
+			release_textures(&app.r, &p.vt.gfx)
 		}
 		if len(app.spaces) == 0 do break
 		if app.dirty && time.tick_since(app.last_frame) >= app.frame_time && !syncing(app) do render(app)

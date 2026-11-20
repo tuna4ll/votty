@@ -163,8 +163,10 @@ default_palette :: proc(p: ^[256]u32) {
 	}
 }
 
-make_term :: proc(cols, rows: int, history_limit := 10000) -> ^Term {
+make_term :: proc(cols, rows: int, history_limit := 10000, images: ^Image_Budget = nil) -> ^Term {
 	t := new(Term)
+	t.gfx.own.limit = IMAGE_QUOTA
+	budget_join(images if images != nil else &t.gfx.own, &t.gfx)
 	t.cols = max(cols, 1)
 	t.rows = max(rows, 1)
 	t.cell_w = 8

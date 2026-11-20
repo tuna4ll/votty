@@ -65,6 +65,7 @@ Config :: struct {
 	platform:      string,
 	persistent:    bool,
 	stats:         bool,
+	image_memory:  int, // bytes for all panes together
 	bindings:      [dynamic]Binding,
 }
 
@@ -192,6 +193,7 @@ config_defaults :: proc(c: ^Config) {
 	c.bold_bright = true
 	c.platform = strings.clone("auto")
 	c.persistent = true
+	c.image_memory = 320 << 20
 	for d in DEFAULT_BINDINGS {
 		b, _ := parse_keys(d.keys)
 		b.action = d.action
@@ -305,6 +307,10 @@ config_set :: proc(c: ^Config, key, val: string) -> bool {
 		c.opacity = v
 	case key == "bold_is_bright":
 		c.bold_bright = parse_bool(val) or_return
+	case key == "image_memory":
+		v, ok := strconv.parse_int(val)
+		if !ok || v < 1 || v > 16384 do return false
+		c.image_memory = v << 20
 	case key == "stats":
 		c.stats = parse_bool(val) or_return
 	case key == "persistent_buffers":
