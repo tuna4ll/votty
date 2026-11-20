@@ -31,8 +31,8 @@ word_bounds :: proc(t: ^Term, p: Pos, extra := WORD_CHARS) -> (Pos, Pos) {
 	if !ok || p.col >= len(cells) do return p, p
 	at :: proc(cells: []Cell, x: int) -> rune {
 		c := cells[x]
-		if .Spacer in c.attrs && x > 0 do return cells[x - 1].ch
-		return c.ch
+		if .Spacer in c.attrs && x > 0 do return base_rune(cells[x - 1].ch)
+		return base_rune(c.ch)
 	}
 	if !is_word(at(cells, p.col), extra) do return p, p
 	a, b := p.col, p.col
@@ -71,8 +71,8 @@ selection_text :: proc(t: ^Term, from, to: Pos, allocator := context.allocator) 
 		for x in x0 ..< x1 {
 			c := cells[x]
 			if .Spacer in c.attrs do continue
-			strings.write_rune(&sb, c.ch if c.ch != 0 else ' ')
-			if c.mark != 0 do strings.write_rune(&sb, rune(c.mark))
+			buf: [4]u8
+			strings.write_string(&sb, cell_text(c.ch, &buf))
 		}
 		joined := wrapped && l != b.line
 		if !joined {

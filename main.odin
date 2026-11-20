@@ -258,7 +258,7 @@ draw_search_bar :: proc(app: ^App, p: ^Pane) {
 	draw_text(r, f, f32(p.x + PAD), y + 1, label, pack(0x8899aa, 1))
 	draw_text(r, f, qx, y + 1, string(p.query[:]), pack(0xffffff, 1), rx - f32(f.cell_w))
 	draw_text(r, f, rx, y + 1, right, pack(0x8899aa, 1))
-	flush_rects(r, .Glyph, f.tex)
+	flush_glyphs(r, f)
 }
 
 // advances a running search and brings its match into view
@@ -329,10 +329,10 @@ draw_cursor :: proc(app: ^App, p: ^Pane, ox, oy: int, focused: bool) {
 		push_rect(r, px, py, cw, f32(f.cell_h), col)
 		flush_rects(r, .Solid)
 		style := Style(int(.Bold in c.attrs) | int(.Italic in c.attrs) << 1)
-		slot := glyph_slot(f, c.ch, c.mark, style, wide)
+		slot := glyph_slot(f, c.ch, style, wide)
 		_, bg := cell_colors(r, t, c)
 		push_glyph(r, f, px, py, slot, wide, bg | 0xff000000)
-		flush_rects(r, .Glyph, f.tex)
+		flush_glyphs(r, f)
 	case .Underline:
 		push_rect(r, px, py + f32(f.cell_h) - 2 * th, cw, 2 * th, col)
 		flush_rects(r, .Solid)

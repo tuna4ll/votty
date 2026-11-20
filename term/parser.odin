@@ -555,7 +555,7 @@ csi_dispatch :: proc(t: ^Term, final: u8) {
 
 @(private)
 soft_reset :: proc(t: ^Term) {
-	t.modes = (t.modes & {.Alt_Screen}) + {.Wrap, .Cursor_Visible}
+	t.modes = (t.modes & {.Alt_Screen, .Grapheme}) + {.Wrap, .Cursor_Visible}
 	t.cur.pen = {}
 	t.cur.origin = false
 	t.cur.charset = {'B', 'B'}
@@ -606,6 +606,8 @@ private_mode :: proc(n: int) -> (m: Mode, ok: bool) {
 		return .Bracketed_Paste, true
 	case 2026:
 		return .Sync_Output, true
+	case 2027:
+		return .Grapheme, true
 	}
 	return
 }
@@ -689,16 +691,18 @@ sgr :: proc(t: ^Term) {
 	p := &t.parser
 	pen := &t.cur.pen
 	if p.n == 0 {
+		link := pen.link
 		pen^ = {}
+		pen.link = link
 		return
 	}
 	for i := 0; i < p.n; i += 1 {
 		v := p.params[i]
 		switch v {
 		case 0:
-			pen.attrs = {}
-			pen.fg = COLOR_DEFAULT
-			pen.bg = COLOR_DEFAULT
+			link := pen.link
+			pen^ = {}
+			pen.link = link
 		case 1:
 			pen.attrs += {.Bold}
 		case 2:
@@ -753,6 +757,8 @@ sgr :: proc(t: ^Term) {
 			pen.bg = color_index(v - 40)
 		case 49:
 			pen.bg = COLOR_DEFAULT
+		case 59:
+			pen.ul = COLOR_DEFAULT
 		case 53:
 			pen.attrs += {.Overline}
 		case 55:
@@ -764,10 +770,13 @@ sgr :: proc(t: ^Term) {
 		case 38, 48, 58:
 			col, next := extended_color(p, i)
 			i = next
-			if v == 38 {
+			switch v {
+			case 38:
 				pen.fg = col
-			} else if v == 48 {
+			case 48:
 				pen.bg = col
+			case 58:
+				pen.ul = col
 			}
 		}
 		// skip stray subparameters

@@ -31,16 +31,16 @@ Attr :: enum u16 {
 }
 Attrs :: bit_set[Attr;u16]
 
-// 16 bytes; the renderer reads rows of these directly
+// ch is a code point or an interned cluster (see cluster.odin)
 Cell :: struct {
 	ch:    rune,
 	fg:    Color,
 	bg:    Color,
+	ul:    Color, // underline color, default follows fg
 	attrs: Attrs,
-	// shortcut: one combining mark per cell from the bmp, extend if multi-mark scripts matter
-	mark:  u16,
+	link:  u16, // hyperlink id
 }
-#assert(size_of(Cell) == 16)
+#assert(size_of(Cell) == 20)
 
 Mode :: enum {
 	Wrap,
@@ -62,6 +62,7 @@ Mode :: enum {
 	Alt_Scroll,
 	Alt_Screen,
 	Sync_Output,
+	Grapheme, // 2027: join grapheme clusters into one cell
 }
 Modes :: bit_set[Mode]
 
@@ -119,6 +120,7 @@ Term :: struct {
 	parser:       Parser,
 	shape:        Cursor_Shape,
 	last_ch:      rune,
+	join:         bool, // the last char was a zero width joiner
 	palette:      [256]u32,
 	fg, bg:       u32,
 	cursor_color: u32,
@@ -209,7 +211,7 @@ set_theme :: proc(t: ^Term, th: Theme) {
 }
 
 reset :: proc(t: ^Term) {
-	t.modes = {.Wrap, .Cursor_Visible}
+	t.modes = {.Wrap, .Cursor_Visible, .Grapheme}
 	if t.theme.blink do t.modes += {.Cursor_Blink}
 	t.cur = {}
 	t.cur.charset = {'B', 'B'}
@@ -274,7 +276,7 @@ rune_width :: proc(r: rune) -> int {
 	if r < 0x300 {
 		return 1 if r >= 0x20 && (r < 0x7f || r >= 0xa0) else 0
 	}
-	if unicode.is_nonspacing_mark(r) || unicode.is_enclosing_mark(r) do return 0
+	if unicode.is_nonspacing_mark(r) || unicode.is_enclosing_mark(r) || r == 0x200d do return 0
 	return unicode.normalized_east_asian_width(r)
 }
 
@@ -425,10 +427,13 @@ fix_wide :: proc(t: ^Term, r: []Cell, x: int) {
 print :: proc(t: ^Term, ch: rune) {
 	ch := ch
 	w := rune_width(ch)
-	if w == 0 {
+	// after a zero width joiner the next char belongs to the same cluster
+	if w == 0 || (.Grapheme in t.modes && joins_previous(t, ch)) {
 		attach_mark(t, ch)
+		t.join = ch == 0x200d
 		return
 	}
+	t.join = false
 	if t.cur.charset[t.cur.gl] == '0' && ch >= 0x5f && ch <= 0x7e {
 		ch = DEC_GRAPHICS[ch - 0x5f]
 	}
@@ -461,7 +466,6 @@ print :: proc(t: ^Term, ch: rune) {
 	if w == 2 do fix_wide(t, r, x + 1)
 	c := t.cur.pen
 	c.ch = ch
-	c.mark = 0
 	if w == 2 {
 		c.attrs += {.Wide}
 		r[x] = c
@@ -503,7 +507,6 @@ print_ascii :: proc(t: ^Term, s: []u8) {
 		fix_wide(t, r, x)
 		fix_wide(t, r, x + n - 1)
 		c := t.cur.pen
-		c.mark = 0
 		for k in 0 ..< n {
 			c.ch = rune(s[i + k])
 			r[x + k] = c
@@ -519,14 +522,49 @@ print_ascii :: proc(t: ^Term, s: []u8) {
 	t.last_ch = rune(s[len(s) - 1])
 }
 
+// in grapheme mode, chars after a joiner, skin tones and the second half of a flag
+// belong to the cluster before them
+@(private)
+joins_previous :: proc(t: ^Term, ch: rune) -> bool {
+	if ch < 0x2000 do return false
+	if t.join do return true
+	if !unicode.is_emoji_modifier(ch) && !unicode.is_regional_indicator(ch) do return false
+	x := t.cur.x if t.cur.wrap else t.cur.x - 1
+	if x < 0 do return false
+	r := screen_row(t, t.scr, t.cur.y)
+	if .Spacer in r[x].attrs && x > 0 do x -= 1
+	prev := r[x].ch
+	if unicode.is_regional_indicator(ch) {
+		// pair up exactly two indicators
+		return !is_cluster(prev) && unicode.is_regional_indicator(prev)
+	}
+	return prev != 0 && unicode.is_emoji_extended_pictographic(base_rune(prev))
+}
+
+// zero width code points extend the cluster of the previous cell
 @(private)
 attach_mark :: proc(t: ^Term, ch: rune) {
-	if ch > 0xffff || !(unicode.is_nonspacing_mark(ch) || unicode.is_enclosing_mark(ch)) do return
 	x := t.cur.x if t.cur.wrap else t.cur.x - 1
 	if x < 0 do return
 	r := row(t, t.cur.y)
 	if .Spacer in r[x].attrs && x > 0 do x -= 1
-	if r[x].ch != 0 && r[x].mark == 0 do r[x].mark = u16(ch)
+	if r[x].ch == 0 do return
+	r[x].ch = cluster_append(r[x].ch, ch)
+	t.join = ch == 0x200d
+	// a flag spans the two cells its indicators would have taken
+	if unicode.is_regional_indicator(ch) && .Wide not_in r[x].attrs && x + 1 < t.cols && !t.cur.wrap {
+		fix_wide(t, r, x + 1)
+		r[x].attrs += {.Wide}
+		r[x + 1] = r[x]
+		r[x + 1].attrs = r[x].attrs - {.Wide} + {.Spacer}
+		r[x + 1].ch = 0
+		if x + 2 >= t.cols {
+			t.cur.x = t.cols - 1
+			t.cur.wrap = .Wrap in t.modes
+		} else {
+			t.cur.x = x + 2
+		}
+	}
 }
 
 erase_cells :: proc(t: ^Term, y, from, to: int) {

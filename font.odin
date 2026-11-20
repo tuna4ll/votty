@@ -4,6 +4,8 @@ import "core:c"
 import "core:math"
 import "core:os"
 import "core:strings"
+import "core:unicode"
+import "term"
 import stbtt "vendor:stb/truetype"
 import gl "vendor:OpenGL"
 
@@ -36,21 +38,29 @@ Style :: enum u8 {
 }
 
 Face :: struct {
-	path:      string,
-	data:      []u8,
-	info:      stbtt.fontinfo,
-	scale:     f32,
+	path:        string,
+	data:        []u8,
+	borrowed:    bool, // a synthetic style sharing another face's data
+	info:        stbtt.fontinfo,
+	outlines:    bool, // stb_truetype can draw it
+	scale:       f32,
 	fake_bold:   bool,
 	fake_italic: bool,
+	hb_blob:     ^Hb_Blob,
+	hb_face:     ^Hb_Face,
+	hb_font:     ^Hb_Font,
+	upem:        int,
+	cblc, cbdt:  int, // color bitmap tables, -1 when absent
 }
 
 Glyph_Key :: struct {
 	ch:    rune,
-	mark:  u16,
 	style: Style,
 }
 
 ATLAS_SIZE :: 2048
+// glyph ids with this bit live in the color atlas
+COLOR_BIT :: u32(1) << 31
 
 Fonts :: struct {
 	family:     string,
@@ -64,8 +74,9 @@ Fonts :: struct {
 	baseline:   int,
 	underline:  int,
 	thickness:  int,
-	// atlas of cell sized slots; slot 0 stays empty
+	// atlases of cell sized slots sharing one slot numbering; slot 0 stays empty
 	tex:        u32,
+	ctex:       u32,
 	slots_x:    int,
 	slots:      int,
 	next:       int,
@@ -73,6 +84,8 @@ Fonts :: struct {
 	cache:      map[Glyph_Key]u32,
 	generation: int,
 	scratch:    []u8,
+	cscratch:   []u8,
+	shaped:     [dynamic]Shaped,
 }
 
 fc_match :: proc(query: string, ch: rune = 0) -> (path: string, index: int, ok: bool) {
@@ -105,7 +118,13 @@ load_face :: proc(path: string, index: int) -> ^Face {
 	f.path = path
 	f.data = data
 	off := stbtt.GetFontOffsetForIndex(raw_data(data), c.int(index))
-	if off < 0 || !stbtt.InitFont(&f.info, raw_data(data), off) {
+	f.outlines = off >= 0 && bool(stbtt.InitFont(&f.info, raw_data(data), off))
+	start := max(int(off), 0)
+	f.cblc = find_table(data, start, "CBLC")
+	f.cbdt = find_table(data, start, "CBDT")
+	// fonts without outlines are still usable when they carry color bitmaps
+	if !hb_open(f, index) || (!f.outlines && (f.cblc < 0 || f.cbdt < 0)) {
+		hb_close(f)
 		delete(data)
 		free(f)
 		return nil
@@ -114,9 +133,24 @@ load_face :: proc(path: string, index: int) -> ^Face {
 }
 
 free_face :: proc(f: ^Face) {
-	delete(f.data)
+	if !f.borrowed {
+		hb_close(f)
+		delete(f.data)
+	}
 	delete(f.path)
 	free(f)
+}
+
+face_scale :: proc(f: ^Face, px: f32) -> f32 {
+	if f.outlines do return stbtt.ScaleForMappingEmToPixels(&f.info, px)
+	return px / f32(max(f.upem, 1))
+}
+
+glyph_index :: proc(f: ^Face, ch: rune) -> u32 {
+	if f.outlines do return u32(stbtt.FindGlyphIndex(&f.info, ch))
+	g: u32
+	if hb_font_get_nominal_glyph(f.hb_font, u32(ch), &g) do return g
+	return 0
 }
 
 fonts_init :: proc(f: ^Fonts, family: string, size: f32, dpi_scale: f32, weight := "") -> bool {
@@ -140,7 +174,12 @@ fonts_init :: proc(f: ^Fonts, family: string, size: f32, dpi_scale: f32, weight 
 			continue
 		}
 		f.faces[s] = load_face(path, idx)
-		if f.faces[s] == nil do delete(path)
+		if f.faces[s] == nil {
+			delete(path)
+		} else if !f.faces[s].outlines {
+			free_face(f.faces[s])
+			f.faces[s] = nil
+		}
 	}
 	if f.faces[.Regular] == nil do return false
 	// synthesize missing styles from the closest face
@@ -166,30 +205,22 @@ fake_style :: proc(base: ^Face, bold: bool) -> ^Face {
 	b := new(Face)
 	b^ = base^
 	b.path = strings.clone(base.path)
-	b.data = nil
+	b.borrowed = true
 	if bold do b.fake_bold = true
 	return b
 }
 
 fonts_destroy :: proc(f: ^Fonts) {
-	for s in Style {
-		face := f.faces[s]
-		if face == nil do continue
-		// styles may alias the same face
-		for t in Style do if t > s && f.faces[t] == face do f.faces[t] = nil
-		if face.data == nil {
-			delete(face.path)
-			free(face)
-		} else {
-			free_face(face)
-		}
-	}
+	for s in Style do if f.faces[s] != nil do free_face(f.faces[s])
 	for fb in f.fallbacks do free_face(fb)
 	delete(f.fallbacks)
 	delete(f.missing)
 	delete(f.cache)
 	delete(f.scratch)
+	delete(f.cscratch)
+	delete(f.shaped)
 	if f.tex != 0 do gl.DeleteTextures(1, &f.tex)
+	if f.ctex != 0 do gl.DeleteTextures(1, &f.ctex)
 }
 
 fonts_set_size :: proc(f: ^Fonts, size: f32, dpi_scale: f32) {
@@ -198,7 +229,7 @@ fonts_set_size :: proc(f: ^Fonts, size: f32, dpi_scale: f32) {
 	reg := f.faces[.Regular]
 	scale := stbtt.ScaleForMappingEmToPixels(&reg.info, f.px)
 	for face in f.faces do face.scale = scale
-	for fb in f.fallbacks do fb.scale = stbtt.ScaleForMappingEmToPixels(&fb.info, f.px)
+	for fb in f.fallbacks do fb.scale = face_scale(fb, f.px)
 	asc, desc, gap: c.int
 	stbtt.GetFontVMetrics(&reg.info, &asc, &desc, &gap)
 	adv, lsb: c.int
@@ -211,16 +242,20 @@ fonts_set_size :: proc(f: ^Fonts, size: f32, dpi_scale: f32) {
 	atlas_reset(f)
 }
 
+@(private = "file")
+make_atlas :: proc(tex: ^u32, internal: i32, format: u32) {
+	gl.GenTextures(1, tex)
+	gl.BindTexture(gl.TEXTURE_2D, tex^)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+	gl.TexImage2D(gl.TEXTURE_2D, 0, internal, ATLAS_SIZE, ATLAS_SIZE, 0, format, gl.UNSIGNED_BYTE, nil)
+}
+
 atlas_reset :: proc(f: ^Fonts) {
-	if f.tex == 0 {
-		gl.GenTextures(1, &f.tex)
-		gl.BindTexture(gl.TEXTURE_2D, f.tex)
-		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
-		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
-		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.R8, ATLAS_SIZE, ATLAS_SIZE, 0, gl.RED, gl.UNSIGNED_BYTE, nil)
-	}
+	if f.tex == 0 do make_atlas(&f.tex, gl.R8, gl.RED)
+	if f.ctex == 0 do make_atlas(&f.ctex, gl.RGBA8, gl.RGBA)
 	f.slots_x = ATLAS_SIZE / f.cell_w
 	f.slots = f.slots_x * (ATLAS_SIZE / f.cell_h)
 	f.next = 1
@@ -228,37 +263,45 @@ atlas_reset :: proc(f: ^Fonts) {
 	for s in Style do f.ascii[s] = {}
 	f.generation += 1
 	delete(f.scratch)
+	delete(f.cscratch)
 	f.scratch = make([]u8, f.cell_w * 2 * f.cell_h)
+	f.cscratch = make([]u8, f.cell_w * 2 * f.cell_h * 4)
 	// clear slot 0 so empty cells sample nothing
 	gl.BindTexture(gl.TEXTURE_2D, f.tex)
 	gl.PixelStorei(gl.UNPACK_ALIGNMENT, 1)
 	gl.TexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, i32(f.cell_w), i32(f.cell_h), gl.RED, gl.UNSIGNED_BYTE, raw_data(f.scratch))
 }
 
+// the face that can draw ch; color faces win when emoji presentation is asked for
 @(private = "file")
-face_for :: proc(f: ^Fonts, ch: rune, style: Style) -> (^Face, c.int) {
-	face := f.faces[style]
-	if g := stbtt.FindGlyphIndex(&face.info, ch); g != 0 do return face, g
-	if style != .Regular {
-		face = f.faces[.Regular]
-		if g := stbtt.FindGlyphIndex(&face.info, ch); g != 0 do return face, g
+face_for :: proc(f: ^Fonts, ch: rune, style: Style, color := false) -> (^Face, u32) {
+	if !color {
+		face := f.faces[style]
+		if g := glyph_index(face, ch); g != 0 do return face, g
+		if style != .Regular {
+			face = f.faces[.Regular]
+			if g := glyph_index(face, ch); g != 0 do return face, g
+		}
 	}
 	for fb in f.fallbacks {
-		if g := stbtt.FindGlyphIndex(&fb.info, ch); g != 0 do return fb, g
+		if color && fb.cbdt < 0 do continue
+		if g := glyph_index(fb, ch); g != 0 do return fb, g
 	}
-	if ch in f.missing do return nil, 0
-	path, idx, ok := fc_match(f.family, ch)
+	key := ch | (rune(1) << 30 if color else 0)
+	if key in f.missing {
+		// no color font has it; settle for any outline
+		if color do return face_for(f, ch, style)
+		return nil, 0
+	}
+	path, idx, ok := fc_match("emoji" if color else f.family, ch)
 	if ok {
-		for fb in f.fallbacks do if fb.path == path {
-			delete(path)
-			f.missing[ch] = true
-			return nil, 0
-		}
-		if path == f.faces[.Regular].path {
+		known := path == f.faces[.Regular].path
+		for fb in f.fallbacks do if fb.path == path do known = true
+		if known {
 			delete(path)
 		} else if fb := load_face(path, idx); fb != nil {
-			if g := stbtt.FindGlyphIndex(&fb.info, ch); g != 0 {
-				fb.scale = stbtt.ScaleForMappingEmToPixels(&fb.info, f.px)
+			if g := glyph_index(fb, ch); g != 0 && (!color || fb.cbdt >= 0) {
+				fb.scale = face_scale(fb, f.px)
 				append(&f.fallbacks, fb)
 				return fb, g
 			}
@@ -267,13 +310,16 @@ face_for :: proc(f: ^Fonts, ch: rune, style: Style) -> (^Face, c.int) {
 			delete(path)
 		}
 	}
-	f.missing[ch] = true
+	f.missing[key] = true
+	if color do return face_for(f, ch, style)
 	return nil, 0
 }
 
-// draws a glyph into the scratch bitmap at pen x, max-blending coverage
+// draws an outline glyph into the scratch bitmap at a pen position, max-blending coverage
 @(private = "file")
-draw_glyph :: proc(f: ^Fonts, face: ^Face, g: c.int, pen_x: f32, width: int) {
+draw_glyph :: proc(f: ^Fonts, face: ^Face, glyph: u32, pen_x, pen_y: f32, width: int) {
+	if !face.outlines do return
+	g := c.int(glyph)
 	scale := face.scale
 	// shrink fallback glyphs that would overflow their cells
 	adv, lsb: c.int
@@ -288,7 +334,7 @@ draw_glyph :: proc(f: ^Fonts, face: ^Face, g: c.int, pen_x: f32, width: int) {
 	tmp := make([]u8, gw * gh, context.temp_allocator)
 	stbtt.MakeGlyphBitmapSubpixel(&face.info, raw_data(tmp), c.int(gw), c.int(gh), c.int(gw), scale, scale, 0, 0, g)
 	ox := int(math.round(pen_x)) + int(x0)
-	oy := f.baseline + int(y0)
+	oy := f.baseline - int(math.round(pen_y)) + int(y0)
 	sw := f.cell_w * 2
 	passes := 2 if face.fake_bold else 1
 	for pass in 0 ..< passes {
@@ -308,51 +354,87 @@ draw_glyph :: proc(f: ^Fonts, face: ^Face, g: c.int, pen_x: f32, width: int) {
 	}
 }
 
+// rasterizes a cell's char or cluster into a scratch bitmap; true when it went to the color one
+@(private = "file")
+rasterize :: proc(f: ^Fonts, ch: rune, style: Style, width: int) -> bool {
+	text := make([dynamic]rune, context.temp_allocator)
+	buf: [4]u8
+	for r in term.cell_text(ch, &buf) do append(&text, r)
+	base := text[0]
+	if len(text) == 1 && is_box_char(base) && width == f.cell_w {
+		draw_box_char(f, base)
+		return false
+	}
+	// variation selector 16 asks for emoji presentation
+	emoji := false
+	for r in text[1:] do if r == 0xfe0f do emoji = true
+	face, g := face_for(f, base, style, emoji || unicode.is_emoji_extended_pictographic(base) && width > f.cell_w)
+	if face == nil {
+		draw_box(f, width)
+		return false
+	}
+	clear(&f.shaped)
+	if len(text) == 1 {
+		append(&f.shaped, Shaped{glyph = g})
+	} else {
+		shape(face, text[:], &f.shaped)
+	}
+	if face.cbdt >= 0 && len(f.shaped) > 0 && draw_color(f, face, f.shaped[0].glyph, width) do return true
+	for s in f.shaped {
+		if s.glyph != 0 {
+			draw_glyph(f, face, s.glyph, s.x, s.y, width)
+			continue
+		}
+		// marks this face lacks come from wherever they exist, stacked over the base
+		r := text[s.rune_i]
+		if r == 0x200d || (r >= 0xfe00 && r <= 0xfe0f) do continue
+		if mface, mg := face_for(f, r, style); mface != nil {
+			adv, lsb: c.int
+			if mface.outlines do stbtt.GetGlyphHMetrics(&mface.info, c.int(mg), &adv, &lsb)
+			pen: f32 = 0 if adv > 0 else f32(f.cell_w)
+			draw_glyph(f, mface, mg, pen, 0, width)
+		}
+	}
+	return false
+}
+
 // returns the atlas slot of a glyph, rasterizing on first use; wide glyphs own slot+1 too
-glyph_slot :: proc(f: ^Fonts, ch: rune, mark: u16, style: Style, wide: bool) -> u32 {
-	if ch <= ' ' && mark == 0 do return 0
-	if ch < 128 && mark == 0 {
+glyph_slot :: proc(f: ^Fonts, ch: rune, style: Style, wide: bool) -> u32 {
+	if ch <= ' ' do return 0
+	if ch < 128 {
 		if id := f.ascii[style][ch]; id != 0 do return id
 	} else {
-		if id, ok := f.cache[{ch, mark, style}]; ok do return id
+		if id, ok := f.cache[{ch, style}]; ok do return id
 	}
 	n := 2 if wide else 1
 	// keep both halves of a wide glyph on one atlas row
 	if wide && f.next % f.slots_x == f.slots_x - 1 do f.next += 1
 	if f.next + n > f.slots {
 		atlas_reset(f)
-		return glyph_slot(f, ch, mark, style, wide)
+		return glyph_slot(f, ch, style, wide)
 	}
-	id := u32(f.next)
+	slot := f.next
 	f.next += n
 	width := f.cell_w * n
 	for &b in f.scratch do b = 0
-	if is_box_char(ch) && !wide {
-		draw_box_char(f, ch)
-	} else if face, g := face_for(f, ch, style); face != nil {
-		draw_glyph(f, face, g, 0, width)
-		if mark != 0 && !(mark >= 0xfe00 && mark <= 0xfe0f) {
-			if mface, mg := face_for(f, rune(mark), style); mface != nil {
-				adv, lsb: c.int
-				stbtt.GetGlyphHMetrics(&mface.info, mg, &adv, &lsb)
-				pen: f32 = 0 if adv > 0 else f32(f.cell_w)
-				draw_glyph(f, mface, mg, pen, width)
-			}
-		}
-	} else if ch > ' ' {
-		draw_box(f, width)
-	}
-	gl.BindTexture(gl.TEXTURE_2D, f.tex)
+	for &b in f.cscratch do b = 0
+	color := rasterize(f, ch, style, width)
+	gl.BindTexture(gl.TEXTURE_2D, f.ctex if color else f.tex)
 	gl.PixelStorei(gl.UNPACK_ALIGNMENT, 1)
 	gl.PixelStorei(gl.UNPACK_ROW_LENGTH, i32(f.cell_w * 2))
-	sx := int(id) % f.slots_x * f.cell_w
-	sy := int(id) / f.slots_x * f.cell_h
-	gl.TexSubImage2D(gl.TEXTURE_2D, 0, i32(sx), i32(sy), i32(width), i32(f.cell_h), gl.RED, gl.UNSIGNED_BYTE, raw_data(f.scratch))
+	sx := slot % f.slots_x * f.cell_w
+	sy := slot / f.slots_x * f.cell_h
+	if color {
+		gl.TexSubImage2D(gl.TEXTURE_2D, 0, i32(sx), i32(sy), i32(width), i32(f.cell_h), gl.RGBA, gl.UNSIGNED_BYTE, raw_data(f.cscratch))
+	} else {
+		gl.TexSubImage2D(gl.TEXTURE_2D, 0, i32(sx), i32(sy), i32(width), i32(f.cell_h), gl.RED, gl.UNSIGNED_BYTE, raw_data(f.scratch))
+	}
 	gl.PixelStorei(gl.UNPACK_ROW_LENGTH, 0)
-	if ch < 128 && mark == 0 {
+	id := u32(slot) | (COLOR_BIT if color else 0)
+	if ch < 128 {
 		f.ascii[style][ch] = id
 	} else {
-		f.cache[{ch, mark, style}] = id
+		f.cache[{ch, style}] = id
 	}
 	return id
 }

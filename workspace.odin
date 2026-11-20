@@ -385,7 +385,7 @@ draw_tab_bar :: proc(app: ^App) {
 		x = draw_text(r, f, x, 2, l, color, sx) + 1
 	}
 	draw_text(r, f, sx, 2, space, pack(0xd0d8e0, 1))
-	flush_rects(r, .Glyph, f.tex)
+	flush_glyphs(r, f)
 }
 
 draw_borders :: proc(app: ^App) {

@@ -29,7 +29,8 @@ search_free :: proc(s: ^Search) {
 }
 
 @(private)
-fold :: #force_inline proc(r: rune, sensitive: bool) -> rune {
+fold :: #force_inline proc(ch: rune, sensitive: bool) -> rune {
+	r := base_rune(ch) if is_cluster(ch) else ch
 	if r == 0 do return ' '
 	if sensitive || r < 'A' do return r
 	if r <= 'Z' do return r + 32

@@ -11,6 +11,7 @@ layout(location = 1) in uint a_fg;
 layout(location = 2) in uint a_bg;
 layout(location = 3) in uint a_flags;
 layout(location = 4) in int a_row;
+layout(location = 5) in uint a_ul;
 uniform vec2 u_origin;
 uniform vec2 u_cell;
 uniform vec2 u_screen;
@@ -20,6 +21,7 @@ flat out uint v_glyph;
 flat out vec4 v_fg;
 flat out vec4 v_bg;
 flat out uint v_flags;
+flat out vec4 v_ul;
 vec4 unpack(uint c) {
 	return vec4(float(c & 0xffu), float((c >> 8) & 0xffu), float((c >> 16) & 0xffu), float(c >> 24)) / 255.0;
 }
@@ -31,6 +33,7 @@ void main() {
 	v_fg = unpack(a_fg);
 	v_bg = unpack(a_bg);
 	v_flags = a_flags;
+	v_ul = unpack(a_ul);
 	vec2 ndc = px / u_screen * 2.0 - 1.0;
 	gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
 }
@@ -42,7 +45,9 @@ flat in uint v_glyph;
 flat in vec4 v_fg;
 flat in vec4 v_bg;
 flat in uint v_flags;
+flat in vec4 v_ul;
 uniform sampler2D u_tex;
+uniform sampler2D u_ctex;
 uniform int u_pass;
 uniform int u_slots_x;
 uniform vec2 u_cell;
@@ -55,26 +60,37 @@ void main() {
 		color = vec4(v_bg.rgb * v_bg.a, v_bg.a);
 		return;
 	}
-	float a = 0.0;
-	if (v_glyph != 0u) {
-		ivec2 slot = ivec2(int(v_glyph) % u_slots_x, int(v_glyph) / u_slots_x) * ivec2(u_cell);
-		a = texelFetch(u_tex, slot + ivec2(v_local), 0).r;
+	// glyph coverage, premultiplied
+	vec4 glyph = vec4(0.0);
+	uint id = v_glyph & 0x7fffffffu;
+	if (id != 0u) {
+		ivec2 p = ivec2(int(id) % u_slots_x, int(id) / u_slots_x) * ivec2(u_cell) + ivec2(v_local);
+		if ((v_glyph & 0x80000000u) != 0u) {
+			glyph = texelFetch(u_ctex, p, 0);
+		} else {
+			float a = texelFetch(u_tex, p, 0).r * v_fg.a;
+			glyph = vec4(v_fg.rgb * a, a);
+		}
 	}
 	float y = v_local.y;
-	if ((v_flags & 1u) != 0u && y >= u_underline && y < u_underline + u_thick) a = 1.0;
+	float u = 0.0;
+	if ((v_flags & 1u) != 0u && y >= u_underline && y < u_underline + u_thick) u = 1.0;
 	if ((v_flags & 2u) != 0u) {
 		float y2 = min(u_underline + 2.0 * u_thick, u_cell.y - u_thick);
-		if ((y >= u_underline && y < u_underline + u_thick) || (y >= y2 && y < y2 + u_thick)) a = 1.0;
+		if ((y >= u_underline && y < u_underline + u_thick) || (y >= y2 && y < y2 + u_thick)) u = 1.0;
 	}
 	if ((v_flags & 4u) != 0u) {
 		float w = u_underline + u_thick * (1.0 + sin(v_local.x / u_cell.x * 6.2831853));
-		if (abs(y - w) < u_thick * 0.75) a = 1.0;
+		if (abs(y - w) < u_thick * 0.75) u = 1.0;
 	}
-	if ((v_flags & 8u) != 0u && y >= u_strike && y < u_strike + u_thick) a = 1.0;
-	if ((v_flags & 16u) != 0u && y < u_thick) a = 1.0;
-	if (a <= 0.0) discard;
-	a *= v_fg.a;
-	color = vec4(v_fg.rgb * a, a);
+	if ((v_flags & 32u) != 0u && y >= u_underline && y < u_underline + u_thick && mod(v_local.x, 4.0) < 2.0) u = 1.0;
+	float d = 0.0;
+	if ((v_flags & 8u) != 0u && y >= u_strike && y < u_strike + u_thick) d = 1.0;
+	if ((v_flags & 16u) != 0u && y < u_thick) d = 1.0;
+	vec4 ul = v_ul.a > 0.0 ? v_ul : v_fg;
+	vec4 deco = u > 0.0 ? vec4(ul.rgb, 1.0) * ul.a : (d > 0.0 ? vec4(v_fg.rgb, 1.0) * v_fg.a : vec4(0.0));
+	color = deco + glyph * (1.0 - deco.a);
+	if (color.a <= 0.0) discard;
 }
 `
 
@@ -109,6 +125,9 @@ void main() {
 		float a = texelFetch(u_tex, ivec2(v_uv), 0).r * v_color.a;
 		if (a <= 0.0) discard;
 		color = vec4(v_color.rgb * a, a);
+	} else if (u_mode == 3) {
+		color = texelFetch(u_tex, ivec2(v_uv), 0) * v_color.a;
+		if (color.a <= 0.0) discard;
 	} else {
 		vec4 t = texture(u_tex, v_uv);
 		color = vec4(t.rgb * t.a, t.a) * v_color.a;
@@ -117,7 +136,7 @@ void main() {
 `
 
 Grid_Cell :: struct {
-	glyph, fg, bg, flags: u32,
+	glyph, fg, bg, flags, ul: u32,
 }
 
 Rect :: struct {
@@ -130,6 +149,7 @@ Rect_Mode :: enum i32 {
 	Solid,
 	Glyph,
 	Image,
+	Color_Glyph,
 }
 
 // gpu state for one terminal view
@@ -151,7 +171,7 @@ Renderer :: struct {
 	grid:       u32,
 	rect:       u32,
 	grid_u:     struct {
-		origin, cell, screen, cols, tex, pass, slots_x, underline, thick, strike: i32,
+		origin, cell, screen, cols, tex, ctex, pass, slots_x, underline, thick, strike: i32,
 	},
 	rect_u:     struct {
 		screen, tex, mode: i32,
@@ -160,6 +180,7 @@ Renderer :: struct {
 	rect_vbo:   u32,
 	rect_cap:   int,
 	rects:      [dynamic]Rect,
+	crects:     [dynamic]Rect, // color glyphs, flushed after the mono ones
 	persistent: bool,
 	fence:      gl.sync_t,
 	fb_w, fb_h: int,
@@ -196,6 +217,7 @@ renderer_init :: proc(r: ^Renderer, persistent_ok: bool) -> bool {
 		screen    = u(r.grid, "u_screen"),
 		cols      = u(r.grid, "u_cols"),
 		tex       = u(r.grid, "u_tex"),
+		ctex      = u(r.grid, "u_ctex"),
 		pass      = u(r.grid, "u_pass"),
 		slots_x   = u(r.grid, "u_slots_x"),
 		underline = u(r.grid, "u_underline"),
@@ -235,6 +257,7 @@ renderer_destroy :: proc(r: ^Renderer) {
 	}
 	delete(r.textures)
 	delete(r.rects)
+	delete(r.crects)
 }
 
 pane_gpu_free :: proc(g: ^Pane_Gpu) {
@@ -272,10 +295,11 @@ pane_gpu_alloc :: proc(r: ^Renderer, g: ^Pane_Gpu, cols, rows: int) {
 		gl.BufferData(gl.ARRAY_BUFFER, size, nil, gl.DYNAMIC_DRAW)
 		g.staging = make([]Grid_Cell, n)
 	}
-	for i in u32(0) ..< 4 {
-		gl.EnableVertexAttribArray(i)
-		gl.VertexAttribIPointer(i, 1, gl.UNSIGNED_INT, size_of(Grid_Cell), uintptr(i * 4))
-		gl.VertexAttribDivisor(i, 1)
+	for i in u32(0) ..< 5 {
+		loc := i if i < 4 else 5
+		gl.EnableVertexAttribArray(loc)
+		gl.VertexAttribIPointer(loc, 1, gl.UNSIGNED_INT, size_of(Grid_Cell), uintptr(i * 4))
+		gl.VertexAttribDivisor(loc, 1)
 	}
 	g.rowmap = make([]i32, rows)
 	gl.BindBuffer(gl.ARRAY_BUFFER, g.rowbuf)
@@ -336,7 +360,7 @@ write_row :: proc(r: ^Renderer, g: ^Pane_Gpu, f: ^Fonts, t: ^term.Term, slot: in
 			out.glyph = wide_id + 1 if wide_id != 0 else 0
 		} else if .Invisible not_in c.attrs {
 			wide := .Wide in c.attrs
-			out.glyph = glyph_slot(f, c.ch, c.mark, style_of(c.attrs), wide)
+			out.glyph = glyph_slot(f, c.ch, style_of(c.attrs), wide)
 			wide_id = out.glyph if wide else 0
 		}
 		a := c.attrs
@@ -345,6 +369,10 @@ write_row :: proc(r: ^Renderer, g: ^Pane_Gpu, f: ^Fonts, t: ^term.Term, slot: in
 		if .Curly_Underline in a do out.flags |= 4
 		if .Strike in a do out.flags |= 8
 		if .Overline in a do out.flags |= 16
+		if c.ul != term.COLOR_DEFAULT {
+			rgb, _ := resolve(r, t, c.ul, true, false)
+			out.ul = pack(rgb, 1)
+		}
 		dst[x] = out
 	}
 	g.upload_lo = min(g.upload_lo, slot)
@@ -455,6 +483,9 @@ draw_grid :: proc(r: ^Renderer, g: ^Pane_Gpu, f: ^Fonts, x, y: int, pass: i32) {
 	gl.Uniform1f(r.grid_u.thick, f32(f.thickness))
 	gl.Uniform1f(r.grid_u.strike, f32(f.baseline) - f32(f.cell_h) * 0.28)
 	gl.Uniform1i(r.grid_u.tex, 0)
+	gl.Uniform1i(r.grid_u.ctex, 1)
+	gl.ActiveTexture(gl.TEXTURE1)
+	gl.BindTexture(gl.TEXTURE_2D, f.ctex)
 	gl.ActiveTexture(gl.TEXTURE0)
 	gl.BindTexture(gl.TEXTURE_2D, f.tex)
 	gl.BindVertexArray(g.vao)
@@ -468,13 +499,22 @@ push_rect :: proc(r: ^Renderer, x, y, w, h: f32, color: u32) {
 	append(&r.rects, Rect{x = x, y = y, w = w, h = h, color = color})
 }
 
-push_glyph :: proc(r: ^Renderer, f: ^Fonts, x, y: f32, slot: u32, wide: bool, color: u32) {
+push_glyph :: proc(r: ^Renderer, f: ^Fonts, x, y: f32, id: u32, wide: bool, color: u32) {
+	slot := int(id & ~COLOR_BIT)
 	if slot == 0 do return
 	n := 2 if wide else 1
-	sx := f32(int(slot) % f.slots_x * f.cell_w)
-	sy := f32(int(slot) / f.slots_x * f.cell_h)
+	sx := f32(slot % f.slots_x * f.cell_w)
+	sy := f32(slot / f.slots_x * f.cell_h)
 	w, h := f32(f.cell_w * n), f32(f.cell_h)
-	append(&r.rects, Rect{x, y, w, h, sx, sy, sx + w, sy + h, color})
+	append(&r.crects if id & COLOR_BIT != 0 else &r.rects, Rect{x, y, w, h, sx, sy, sx + w, sy + h, color})
+}
+
+// draws glyph rects queued by push_glyph and draw_text, mono then color
+flush_glyphs :: proc(r: ^Renderer, f: ^Fonts) {
+	flush_rects(r, .Glyph, f.tex)
+	r.rects, r.crects = r.crects, r.rects
+	flush_rects(r, .Color_Glyph, f.ctex)
+	r.rects, r.crects = r.crects, r.rects
 }
 
 // draws pending rects with one texture binding and mode; opaque rects replace the destination
@@ -506,7 +546,7 @@ draw_text :: proc(r: ^Renderer, f: ^Fonts, x, y: f32, s: string, color: u32, max
 		w := term.rune_width(ch)
 		if w == 0 do continue
 		if x + f32(f.cell_w * w) > max_x do break
-		push_glyph(r, f, x, y, glyph_slot(f, ch, 0, .Regular, w == 2), w == 2, color)
+		push_glyph(r, f, x, y, glyph_slot(f, ch, .Regular, w == 2), w == 2, color)
 		x += f32(f.cell_w * w)
 	}
 	return x
