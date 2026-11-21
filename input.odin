@@ -1,6 +1,7 @@
 package main
 
 import "core:strings"
+import "core:sys/posix"
 import "core:unicode/utf8"
 import "term"
 import "vendor:glfw"
@@ -77,6 +78,7 @@ on_key :: proc "c" (w: glfw.WindowHandle, key, scancode, action, mods: i32) {
 	context = app.ctx
 	m := to_mods(mods)
 	app.mods = m
+	if key == glfw.KEY_LEFT_CONTROL || key == glfw.KEY_RIGHT_CONTROL do update_hover(app)
 	if action == glfw.RELEASE do return
 	app.skip_char = false
 	if fp := focused(app); fp != nil && fp.searching && search_key(app, fp, key, m) {
@@ -293,6 +295,10 @@ on_mouse_button :: proc "c" (w: glfw.WindowHandle, button, action, mods: i32) {
 		app.drag_split = nil
 		return
 	}
+	if action == glfw.PRESS && button == glfw.MOUSE_BUTTON_LEFT && app.hover.pane != nil {
+		open_url(app.hover.url)
+		return
+	}
 	p := mouse_pane(app)
 	if p == nil do return
 	if action == glfw.PRESS {
@@ -380,10 +386,11 @@ on_cursor_pos :: proc "c" (w: glfw.WindowHandle, x, y: f64) {
 	if app.drag == nil {
 		if n := divider_at(app, int(mx), int(my)); n != nil do kind = 2 if n.stack else 1
 	}
-	if kind != app.cursor_kind {
+	if kind != app.cursor_kind && app.cursor_kind != 3 {
 		app.cursor_kind = kind
 		glfw.SetCursor(app.win, app.cursors[kind])
 	}
+	update_hover(app)
 	p := mouse_pane(app)
 	if p == nil do return
 	col, row := mouse_cell(app, p)
@@ -500,4 +507,52 @@ search_key :: proc(app: ^App, p: ^Pane, key: i32, m: term.Mods) -> bool {
 		return m & {.Ctrl, .Alt, .Super} != {} || map_key(key) != .None
 	}
 	return true
+}
+
+ctrl_held :: proc(app: ^App) -> bool {
+	return glfw.GetKey(app.win, glfw.KEY_LEFT_CONTROL) == glfw.PRESS || glfw.GetKey(app.win, glfw.KEY_RIGHT_CONTROL) == glfw.PRESS
+}
+
+// tracks the link under the mouse while ctrl is held
+update_hover :: proc(app: ^App) {
+	h := &app.hover
+	old_pane, old_a, old_b := h.pane, h.a, h.b
+	h.pane = nil
+	p: ^Pane
+	if ctrl_held(app) && app.drag == nil && app.drag_split == nil do p = mouse_pane(app)
+	if p != nil {
+		col, row := mouse_cell(app, p)
+		t := p.vt
+		if url, a, b, ok := term.url_at(t, {t.hist.total - t.view + row, col}); ok {
+			delete(h.url)
+			h.url, h.pane, h.a, h.b = url, p, a, b
+		}
+	}
+	kind := 3 if h.pane != nil else 0
+	if kind != app.cursor_kind && (kind == 3 || app.cursor_kind == 3) {
+		app.cursor_kind = kind
+		glfw.SetCursor(app.win, app.cursors[kind])
+	}
+	if h.pane != old_pane || h.a != old_a || h.b != old_b do app.dirty = true
+}
+
+// hands a url to xdg-open in a detached grandchild so nothing is left to reap
+open_url :: proc(url: string) {
+	if url == "" || url[0] == '-' do return
+	argv := [3]cstring{"xdg-open", strings.clone_to_cstring(url, context.temp_allocator), nil}
+	pid := posix.fork()
+	if pid < 0 do return
+	if pid == 0 {
+		posix.setsid()
+		if posix.fork() == 0 {
+			null := posix.open("/dev/null", {.RDWR})
+			posix.dup2(null, 0)
+			posix.dup2(null, 1)
+			posix.dup2(null, 2)
+			posix.execvp(argv[0], raw_data(argv[:]))
+		}
+		posix._exit(0)
+	}
+	st: i32
+	posix.waitpid(pid, &st, {})
 }

@@ -1,5 +1,6 @@
 package term
 
+import "base:runtime"
 import "core:strings"
 import "core:unicode/utf8"
 
@@ -47,6 +48,8 @@ cluster_append :: proc(ch: rune, r: rune) -> rune {
 	s := strings.to_string(sb)
 	if id, ok := interned.cluster_ids[s]; ok do return id
 	if len(interned.clusters) >= MAX_CLUSTERS || len(s) > 256 do return ch
+	// the table outlives any one terminal, so it never borrows a caller's allocator
+	context.allocator = runtime.heap_allocator()
 	owned := strings.clone(s)
 	id := CLUSTER_BASE + rune(len(interned.clusters))
 	append(&interned.clusters, owned)
@@ -59,6 +62,7 @@ intern_link :: proc(uri: string) -> u16 {
 	if id, ok := interned.link_ids[uri]; ok do return id
 	// shortcut: links stop being recorded once the table is full; reset it if long sessions need more
 	if len(interned.links) >= MAX_LINKS - 1 do return 0
+	context.allocator = runtime.heap_allocator()
 	owned := strings.clone(uri)
 	append(&interned.links, owned)
 	id := u16(len(interned.links))
@@ -69,4 +73,15 @@ intern_link :: proc(uri: string) -> u16 {
 link_uri :: proc(id: u16) -> string {
 	if id == 0 || int(id) > len(interned.links) do return ""
 	return interned.links[id - 1]
+}
+
+intern_free :: proc() {
+	context.allocator = runtime.heap_allocator()
+	for s in interned.clusters do delete(s)
+	for s in interned.links do delete(s)
+	delete(interned.clusters)
+	delete(interned.cluster_ids)
+	delete(interned.links)
+	delete(interned.link_ids)
+	interned = {}
 }

@@ -835,6 +835,11 @@ osc_dispatch :: proc(t: ^Term, s: string) {
 		}
 	case 7:
 		set_cwd(t, rest)
+	case 8:
+		// params;uri, an empty uri ends the link
+		semi2 := strings.index_byte(rest, ';')
+		uri := "" if semi2 < 0 else rest[semi2 + 1:]
+		t.cur.pen.link = intern_link(uri) if len(uri) <= 4096 else 0
 	case 10, 11, 12:
 		target := [3]^u32{&t.fg, &t.bg, &t.cursor_color}
 		if rest == "?" {

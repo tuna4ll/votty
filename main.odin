@@ -54,7 +54,12 @@ App :: struct {
 	space:       int,
 	drag:        ^Pane, // pane receiving a mouse drag
 	drag_split:  ^Node, // split whose divider is being dragged
-	cursors:     [3]glfw.CursorHandle, // arrow, horizontal, vertical resize
+	cursors:     [4]glfw.CursorHandle, // arrow, horizontal, vertical resize, hand
+	hover:       struct {
+		pane: ^Pane,
+		a, b: term.Pos,
+		url:  string,
+	},
 	cursor_kind: int,
 	tab_hits:    [dynamic]Tab_Hit,
 	dirty:       bool,
@@ -219,6 +224,7 @@ draw_pane :: proc(app: ^App, p: ^Pane, focused: bool) {
 	if p.searching do draw_matches(app, p, ox, oy)
 	draw_grid(r, &p.gpu, f, ox, oy, 1)
 	draw_images(r, f, t, ox, oy, false)
+	if app.hover.pane == p do draw_link_underline(app, p, ox, oy)
 	draw_cursor(app, p, ox, oy, focused)
 	if p.searching do draw_search_bar(app, p)
 }
@@ -289,6 +295,20 @@ highlight :: proc(app: ^App, p: ^Pane, ox, oy: int, a, b: term.Pos, color: u32) 
 		y := l - top
 		push_rect(&app.r, f32(ox + x0 * f.cell_w), f32(oy + y * f.cell_h), f32((x1 - x0 + 1) * f.cell_w), f32(f.cell_h), color)
 	}
+}
+
+draw_link_underline :: proc(app: ^App, p: ^Pane, ox, oy: int) {
+	t := p.vt
+	f := &app.f
+	a, b := app.hover.a, app.hover.b
+	top := t.hist.total - t.view
+	for l in max(a.line, top) ..= min(b.line, top + t.rows - 1) {
+		x0 := a.col if l == a.line else 0
+		x1 := b.col if l == b.line else t.cols - 1
+		y := oy + (l - top) * f.cell_h + f.underline
+		push_rect(&app.r, f32(ox + x0 * f.cell_w), f32(y), f32((x1 - x0 + 1) * f.cell_w), f32(f.thickness), pack(0x6ab0f3, 1))
+	}
+	flush_rects(&app.r, .Solid)
 }
 
 draw_selection :: proc(app: ^App, p: ^Pane, ox, oy: int) {
@@ -391,6 +411,7 @@ main :: proc() {
 	}
 	app := new(App)
 	defer free(app)
+	defer term.intern_free()
 	app.ctx = context
 	posix.signal(.SIGPIPE, auto_cast posix.SIG_IGN)
 
@@ -493,7 +514,9 @@ main :: proc() {
 		glfw.CreateStandardCursor(glfw.ARROW_CURSOR),
 		glfw.CreateStandardCursor(glfw.HRESIZE_CURSOR),
 		glfw.CreateStandardCursor(glfw.VRESIZE_CURSOR),
+		glfw.CreateStandardCursor(glfw.HAND_CURSOR),
 	}
+	defer delete(app.hover.url)
 	defer for c in app.cursors do if c != nil do glfw.DestroyCursor(c)
 	install_callbacks(app)
 	if !new_workspace(app) do os.exit(1)
