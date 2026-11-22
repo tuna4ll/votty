@@ -145,6 +145,11 @@ Rect :: struct {
 	color:          u32,
 }
 
+Texture :: struct {
+	id:      u32,
+	version: u64, // animation frame version uploaded
+}
+
 Rect_Mode :: enum i32 {
 	Solid,
 	Glyph,
@@ -185,7 +190,7 @@ Renderer :: struct {
 	fence:      gl.sync_t,
 	fb_w, fb_h: int,
 	opacity:    f32,
-	textures:   map[u64]u32, // image serial -> texture
+	textures:   map[u64]Texture, // by image serial
 	bold_bright: bool,
 	stats:      struct {
 		rows_written: int,
@@ -252,8 +257,8 @@ renderer_destroy :: proc(r: ^Renderer) {
 	gl.DeleteBuffers(1, &r.rect_vbo)
 	if r.fence != nil do gl.DeleteSync(r.fence)
 	for _, tex in r.textures {
-		tex := tex
-		gl.DeleteTextures(1, &tex)
+		id := tex.id
+		gl.DeleteTextures(1, &id)
 	}
 	delete(r.textures)
 	delete(r.rects)
@@ -358,7 +363,7 @@ write_row :: proc(r: ^Renderer, g: ^Pane_Gpu, f: ^Fonts, t: ^term.Term, slot: in
 		out.fg, out.bg = cell_colors(r, t, c)
 		if .Spacer in c.attrs {
 			out.glyph = wide_id + 1 if wide_id != 0 else 0
-		} else if .Invisible not_in c.attrs {
+		} else if .Invisible not_in c.attrs && term.base_rune(c.ch) != term.PLACEHOLDER {
 			wide := .Wide in c.attrs
 			out.glyph = glyph_slot(f, c.ch, style_of(c.attrs), wide)
 			wide_id = out.glyph if wide else 0
@@ -559,7 +564,16 @@ text_width :: proc(f: ^Fonts, s: string) -> int {
 }
 
 texture_for :: proc(r: ^Renderer, img: ^term.Image) -> u32 {
-	if tex, ok := r.textures[img.serial]; ok do return tex
+	if tex, ok := &r.textures[img.serial]; ok {
+		if tex.version != img.anim.version {
+			// a new animation frame reuses the texture
+			gl.BindTexture(gl.TEXTURE_2D, tex.id)
+			gl.PixelStorei(gl.UNPACK_ALIGNMENT, 1)
+			gl.TexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, i32(img.w), i32(img.h), gl.RGBA, gl.UNSIGNED_BYTE, raw_data(term.shown_pixels(img)))
+			tex.version = img.anim.version
+		}
+		return tex.id
+	}
 	tex: u32
 	gl.GenTextures(1, &tex)
 	gl.BindTexture(gl.TEXTURE_2D, tex)
@@ -568,8 +582,8 @@ texture_for :: proc(r: ^Renderer, img: ^term.Image) -> u32 {
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
 	gl.PixelStorei(gl.UNPACK_ALIGNMENT, 1)
-	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, i32(img.w), i32(img.h), 0, gl.RGBA, gl.UNSIGNED_BYTE, raw_data(img.rgba))
-	r.textures[img.serial] = tex
+	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, i32(img.w), i32(img.h), 0, gl.RGBA, gl.UNSIGNED_BYTE, raw_data(term.shown_pixels(img)))
+	r.textures[img.serial] = {tex, img.anim.version}
 	return tex
 }
 
@@ -577,8 +591,8 @@ texture_for :: proc(r: ^Renderer, img: ^term.Image) -> u32 {
 release_textures :: proc(r: ^Renderer, g: ^term.Graphics) {
 	for serial in g.dropped {
 		if tex, ok := r.textures[serial]; ok {
-			tex := tex
-			gl.DeleteTextures(1, &tex)
+			id := tex.id
+			gl.DeleteTextures(1, &id)
 			delete_key(&r.textures, serial)
 		}
 	}
@@ -590,7 +604,7 @@ draw_images :: proc(r: ^Renderer, f: ^Fonts, t: ^term.Term, ox, oy: int, below: 
 	alt := t.scr == &t.alt
 	top := t.hist.total - t.view
 	for pl in g.placements {
-		if pl.alt != alt || (pl.z < 0) != below do continue
+		if pl.alt != alt || pl.virtual || (pl.z < 0) != below do continue
 		y := pl.line - top
 		if y + pl.rows <= 0 || y >= t.rows do continue
 		img := term.find_image(g, pl.image)
@@ -606,5 +620,50 @@ draw_images :: proc(r: ^Renderer, f: ^Fonts, t: ^term.Term, ox, oy: int, below: 
 		iw, ih := f32(img.w), f32(img.h)
 		append(&r.rects, Rect{px, py, w, h, f32(pl.src[0]) / iw, f32(pl.src[1]) / ih, f32(pl.src[0] + pl.src[2]) / iw, f32(pl.src[1] + pl.src[3]) / ih, 0xffffffff})
 		flush_rects(r, .Image, tex)
+	}
+	if !below do draw_placeholders(r, f, t, ox, oy)
+}
+
+// cells holding U+10EEEE show the matching piece of a virtual placement
+draw_placeholders :: proc(r: ^Renderer, f: ^Fonts, t: ^term.Term, ox, oy: int) {
+	g := &t.gfx
+	any_virtual := false
+	for pl in g.placements do if pl.virtual do any_virtual = true
+	if !any_virtual do return
+	top := t.hist.total - t.view
+	for y in 0 ..< t.rows {
+		cells, _, ok := term.get_line(t, top + y)
+		if !ok do continue
+		prev: term.Placeholder
+		has_prev := false
+		for x in 0 ..< len(cells) {
+			ph, is_ph := term.placeholder_at(cells, x, prev, has_prev)
+			prev, has_prev = ph, is_ph
+			if !is_ph do continue
+			pl: ^term.Placement
+			for &q in g.placements {
+				if q.virtual && q.image == ph.image && (ph.place == 0 || q.id == ph.place) {
+					pl = &q
+					break
+				}
+			}
+			if pl == nil do continue
+			img := term.find_image(g, pl.image)
+			if img == nil || img.w == 0 || img.h == 0 do continue
+			// fit the image into the placement grid keeping its aspect, centered
+			gw, gh := f32(pl.cols * f.cell_w), f32(pl.rows * f.cell_h)
+			k := min(gw / f32(img.w), gh / f32(img.h))
+			iw, ih := f32(img.w) * k, f32(img.h) * k
+			bx, by := (gw - iw) / 2, (gh - ih) / 2
+			// this cell's rectangle in grid pixels, clipped to the image
+			cx0, cy0 := f32(ph.col * f.cell_w), f32(ph.row * f.cell_h)
+			x0, y0 := max(cx0, bx), max(cy0, by)
+			x1, y1 := min(cx0 + f32(f.cell_w), bx + iw), min(cy0 + f32(f.cell_h), by + ih)
+			if x1 <= x0 || y1 <= y0 do continue
+			px := f32(ox + x * f.cell_w) + (x0 - cx0)
+			py := f32(oy + y * f.cell_h) + (y0 - cy0)
+			append(&r.rects, Rect{px, py, x1 - x0, y1 - y0, (x0 - bx) / iw, (y0 - by) / ih, (x1 - bx) / iw, (y1 - by) / ih, 0xffffffff})
+			flush_rects(r, .Image, texture_for(r, img))
+		}
 	}
 }

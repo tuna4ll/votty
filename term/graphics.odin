@@ -22,6 +22,7 @@ Image :: struct {
 	rgba:   []u8,
 	serial: u64, // unique across terminals, keys gpu textures
 	used:   u64, // insertion order for eviction
+	anim:   Animation,
 }
 
 Placement :: struct {
@@ -35,6 +36,7 @@ Placement :: struct {
 	z:          i32,
 	alt:        bool,
 	fit:        bool, // scaled to cols x rows instead of natural size
+	virtual:    bool, // shown only through unicode placeholder cells
 }
 
 Gfx_Cmd :: struct {
@@ -58,6 +60,7 @@ Gfx_Cmd :: struct {
 	no_move:  bool,
 	z:        i32,
 	delete:   u8,
+	unicode:  bool,
 }
 
 Graphics :: struct {
@@ -108,10 +111,7 @@ budget_destroy :: proc(b: ^Image_Budget) {
 graphics_free :: proc(g: ^Graphics) {
 	budget_leave(g)
 	budget_destroy(&g.own)
-	for img in g.images {
-		delete(img.rgba)
-		free(img)
-	}
+	for img in g.images do free_image(img)
 	delete(g.images)
 	delete(g.placements)
 	delete(g.load_data)
@@ -132,11 +132,11 @@ find_number :: proc(g: ^Graphics, n: u32) -> ^Image {
 @(private)
 drop_image :: proc(g: ^Graphics, i: int) {
 	img := g.images[i]
-	g.bytes -= len(img.rgba)
-	g.budget.used -= len(img.rgba)
+	n := image_bytes(img)
+	g.bytes -= n
+	g.budget.used -= n
 	append(&g.dropped, img.serial)
-	delete(img.rgba)
-	free(img)
+	free_image(img)
 	ordered_remove(&g.images, i)
 	g.changed = true
 }
@@ -213,10 +213,12 @@ parse_cmd :: proc(ctl: string) -> (c: Gfx_Cmd, ok: bool) {
 			c.z = i32(clamp(num, int(min(i32)), int(max(i32))))
 		case 'd':
 			c.delete = val[0]
-		case 'U', 'P', 'Q', 'H', 'V':
-		// unicode placeholders and relative placements are not supported
+		case 'U':
+			c.unicode = num == 1
+		case 'P', 'Q', 'H', 'V':
+		// relative placements are not supported
 		}
-		if !is_num && !strings.contains_rune("atodfU", rune(key)) do return c, false
+		if !is_num && !strings.contains_rune("atodf", rune(key)) do return c, false
 		if is_num && num < 0 && key != 'z' do return c, false
 	}
 	return c, true
@@ -260,8 +262,8 @@ graphics_command :: proc(t: ^Term, body: []u8) {
 		return
 	}
 	switch c.action {
-	case 't', 'T', 'q':
-		if c.id == 0 && c.number == 0 && c.action == 'q' do return
+	case 't', 'T', 'q', 'f':
+		if c.id == 0 && c.number == 0 && (c.action == 'q' || c.action == 'f') do return
 		clear(&g.load_data)
 		g.load_bad = false
 		g.load_cmd = c
@@ -282,6 +284,10 @@ graphics_command :: proc(t: ^Term, body: []u8) {
 		gfx_reply(t, c, "OK")
 	case 'd':
 		graphics_delete(t, c)
+	case 'a':
+		animation_control(t, c)
+	case 'c':
+		compose(t, c)
 	case:
 		gfx_reply(t, c, "EINVAL:unsupported action")
 	}
@@ -350,6 +356,10 @@ finish_transmit :: proc(t: ^Term, c: Gfx_Cmd) {
 		gfx_reply(t, c, "OK")
 		return
 	}
+	if c.action == 'f' {
+		add_frame(t, c, rgba, w, h)
+		return
+	}
 	if c.id == 0 {
 		// numbered images get an id the client can learn from the reply
 		g.next_id += 1
@@ -357,10 +367,14 @@ finish_transmit :: proc(t: ^Term, c: Gfx_Cmd) {
 		c.id = g.next_id | 0x80000000 if c.number != 0 else 0
 	}
 	if old := find_image(g, c.id); old != nil && c.id != 0 {
-		account(g, len(rgba) - len(old.rgba))
-		append(&g.dropped, old.serial)
+		before := image_bytes(old)
+		for f in old.anim.extra do delete(f.rgba)
+		clear(&old.anim.extra)
+		old.anim = {extra = old.anim.extra}
 		delete(old.rgba)
+		append(&g.dropped, old.serial)
 		old.rgba = rgba
+		account(g, len(rgba) - before)
 		old.w, old.h = w, h
 		g.budget.serial += 1
 		old.serial = g.budget.serial
@@ -512,8 +526,9 @@ place :: proc(t: ^Term, img: ^Image, c: Gfx_Cmd) {
 		src   = src,
 		off   = c.off,
 		z     = c.z,
-		alt   = t.scr == &t.alt,
-		fit   = c.cols != 0 || c.rows != 0,
+		alt     = t.scr == &t.alt,
+		fit     = c.cols != 0 || c.rows != 0,
+		virtual = c.unicode,
 	}
 	// the same image and placement id replaces the old placement
 	replaced := false
@@ -527,7 +542,7 @@ place :: proc(t: ^Term, img: ^Image, c: Gfx_Cmd) {
 	}
 	if !replaced do append(&g.placements, p)
 	g.changed = true
-	if c.no_move do return
+	if c.no_move || c.unicode do return
 	for _ in 0 ..< rows - 1 do linefeed(t)
 	t.cur.x = min(t.cur.x + cols, t.cols - 1)
 	t.cur.wrap = false
@@ -597,7 +612,7 @@ graphics_delete :: proc(t: ^Term, c: Gfx_Cmd) {
 graphics_drop_before :: proc(t: ^Term, line: int) {
 	g := &t.gfx
 	#reverse for p, i in g.placements {
-		if !p.alt && p.line + p.rows <= line {
+		if !p.alt && !p.virtual && p.line + p.rows <= line {
 			ordered_remove(&g.placements, i)
 			g.changed = true
 		}
@@ -610,7 +625,7 @@ graphics_scroll :: proc(t: ^Term, top, bot, n: int) {
 	alt := t.scr == &t.alt
 	base := t.hist.total
 	#reverse for &p, i in g.placements {
-		if p.alt != alt do continue
+		if p.alt != alt || p.virtual do continue
 		y := p.line - base
 		if y < top || y > bot do continue
 		y += n
@@ -629,7 +644,7 @@ graphics_clear_screen :: proc(t: ^Term) {
 	alt := t.scr == &t.alt
 	base := t.hist.total
 	#reverse for p, i in g.placements {
-		if p.alt == alt && p.line + p.rows > base {
+		if p.alt == alt && !p.virtual && p.line + p.rows > base {
 			ordered_remove(&g.placements, i)
 			g.changed = true
 		}

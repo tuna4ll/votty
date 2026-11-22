@@ -80,6 +80,7 @@ App :: struct {
 	click_pos:   term.Pos,
 	scroll_acc:  f64,
 	mouse_x:     f64,
+	anim_wait:   int, // ms until an animation frame is due, -1 none
 	mouse_y:     f64,
 }
 
@@ -540,14 +541,23 @@ main :: proc() {
 				glfw.PollEvents()
 			}
 		} else {
-			glfw.WaitEventsTimeout(0.5)
+			wait := 0.5
+			if app.anim_wait >= 0 do wait = min(wait, f64(max(app.anim_wait, 1)) / 1000)
+			glfw.WaitEventsTimeout(wait)
 		}
 		if time.tick_since(blink_at) >= 500 * time.Millisecond {
 			blink_at = time.tick_now()
 			app.blink_on = !app.blink_on
 			if p := focused(app); p != nil && .Cursor_Blink in p.vt.modes do app.dirty = true
 		}
+		now := i64(time.tick_now()._nsec / 1_000_000)
+		app.anim_wait = -1
 		for p in all_panes(app) {
+			if w := term.animate(p.vt, now); w >= 0 && (app.anim_wait < 0 || w < app.anim_wait) do app.anim_wait = w
+			if p.vt.gfx.changed {
+				p.vt.gfx.changed = false
+				app.dirty = true
+			}
 			if !pane_pump(app, p) {
 				remove_pane(app, p)
 				continue

@@ -906,7 +906,7 @@ reflow_primary :: proc(t: ^Term, cols, rows: int, on_alt: bool) -> int {
 	// primary placements follow the text they were anchored to
 	g := &t.gfx
 	#reverse for &pl, i in g.placements {
-		if pl.alt do continue
+		if pl.alt || pl.virtual do continue
 		k := pl.line - first
 		if k >= 0 && k < len(old_pos) {
 			row, _ := locate(out[:], line_row, old_pos[k])
