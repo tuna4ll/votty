@@ -72,8 +72,6 @@ App :: struct {
 	command:     []string,
 	cfg:         Config,
 	images:      term.Image_Budget,
-	last_frame:  time.Tick,
-	frame_time:  time.Duration,
 	focused:     bool,
 	clicks:      int,
 	click_time:  f64,
@@ -391,7 +389,6 @@ render :: proc(app: ^App) {
 	app.r.stats.worst = max(app.r.stats.worst, el)
 	glfw.SwapBuffers(app.win)
 	app.dirty = false
-	app.last_frame = time.tick_now()
 }
 
 usage :: proc() {
@@ -478,7 +475,9 @@ main :: proc() {
 	defer glfw.DestroyWindow(app.win)
 	glfw.MakeContextCurrent(app.win)
 	// wayland vsync blocks on frame callbacks with some drivers; pace frames ourselves there
-	glfw.SwapInterval(0 if glfw.GetPlatform() == glfw.PLATFORM_WAYLAND else 1)
+	// vsync paces frames; resize callbacks only mark the window dirty, rendering
+	// from inside a wayland configure stalls presentation
+	glfw.SwapInterval(1)
 	gl.load_up_to(4, 6, glfw.gl_set_proc_address)
 	glfw.SetWindowUserPointer(app.win, app)
 
@@ -505,12 +504,7 @@ main :: proc() {
 	k := f64(fw) / f64(max(ww, 1))
 	glfw.SetWindowSize(app.win, i32(f64(app.cfg.width * app.f.cell_w + 2 * PAD) / k), i32(f64(app.cfg.height * app.f.cell_h + 2 * PAD) / k))
 
-	if glfw.GetPlatform() == glfw.PLATFORM_WAYLAND {
-		app.frame_time = time.Second / 60
-		if mode := glfw.GetVideoMode(glfw.GetPrimaryMonitor()); mode != nil && mode.refresh_rate > 0 {
-			app.frame_time = time.Second / time.Duration(mode.refresh_rate)
-		}
-	}
+
 	app.cursors = {
 		glfw.CreateStandardCursor(glfw.ARROW_CURSOR),
 		glfw.CreateStandardCursor(glfw.HRESIZE_CURSOR),
@@ -533,10 +527,9 @@ main :: proc() {
 
 	for !glfw.WindowShouldClose(app.win) {
 		if app.dirty {
-			wait := app.frame_time - time.tick_since(app.last_frame)
-			if syncing(app) do wait = max(wait, 5 * time.Millisecond)
-			if wait > 0 {
-				glfw.WaitEventsTimeout(time.duration_seconds(wait))
+			// a held synchronized update waits a little instead of spinning
+			if syncing(app) {
+				glfw.WaitEventsTimeout(0.005)
 			} else {
 				glfw.PollEvents()
 			}
@@ -567,7 +560,7 @@ main :: proc() {
 			release_textures(&app.r, &p.vt.gfx)
 		}
 		if len(app.spaces) == 0 do break
-		if app.dirty && time.tick_since(app.last_frame) >= app.frame_time && !syncing(app) do render(app)
+		if app.dirty && !syncing(app) do render(app)
 		free_all(context.temp_allocator)
 	}
 	if app.cfg.stats do print_stats(&app.r)

@@ -129,7 +129,6 @@ on_resize :: proc "c" (w: glfw.WindowHandle, width, height: i32) {
 	app := app_of(w)
 	context = app.ctx
 	layout(app)
-	render(app)
 }
 
 on_scale :: proc "c" (w: glfw.WindowHandle, sx, sy: f32) {
