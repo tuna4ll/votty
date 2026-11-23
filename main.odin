@@ -490,8 +490,7 @@ main :: proc() {
 	app.r.opacity = app.cfg.opacity
 	app.r.bold_bright = app.cfg.bold_bright
 
-	sx, _ := glfw.GetWindowContentScale(app.win)
-	app.scale = max(sx, 1)
+	app.scale = window_scale(app.win)
 	if !fonts_init(&app.f, app.cfg.font, app.cfg.font_size, app.scale, app.cfg.font_weight) {
 		fmt.eprintln("votty: no usable font found")
 		os.exit(1)

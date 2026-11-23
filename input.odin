@@ -125,17 +125,33 @@ on_char :: proc "c" (w: glfw.WindowHandle, ch: rune) {
 	pane_input(app, p, out[:])
 }
 
+// pixels per window unit: the content scale, or the buffer scale where the
+// platform reports the content scale late (wayland before the surface enters an output)
+window_scale :: proc(win: glfw.WindowHandle) -> f32 {
+	sx, _ := glfw.GetWindowContentScale(win)
+	ww, _ := glfw.GetWindowSize(win)
+	fw, _ := glfw.GetFramebufferSize(win)
+	return max(sx, f32(fw) / f32(max(ww, 1)), 1)
+}
+
+update_scale :: proc(app: ^App) {
+	s := window_scale(app.win)
+	if s == app.scale do return
+	app.scale = s
+	set_font_size(app, app.f.size)
+}
+
 on_resize :: proc "c" (w: glfw.WindowHandle, width, height: i32) {
 	app := app_of(w)
 	context = app.ctx
+	update_scale(app)
 	layout(app)
 }
 
 on_scale :: proc "c" (w: glfw.WindowHandle, sx, sy: f32) {
 	app := app_of(w)
 	context = app.ctx
-	app.scale = max(sx, 1)
-	set_font_size(app, app.f.size)
+	update_scale(app)
 }
 
 on_refresh :: proc "c" (w: glfw.WindowHandle) {
