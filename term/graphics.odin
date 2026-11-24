@@ -21,8 +21,10 @@ Image :: struct {
 	w, h:   int,
 	rgba:   []u8,
 	serial: u64, // unique across terminals, keys gpu textures
-	used:   u64, // insertion order for eviction
-	anim:   Animation,
+	used:      u64, // insertion order for eviction
+	anim:      Animation,
+	anonymous: bool, // sent without id or number, never addressable again
+	opaque:    bool,
 }
 
 Placement :: struct {
@@ -268,7 +270,8 @@ graphics_command :: proc(t: ^Term, body: []u8) {
 		g.load_bad = false
 		g.load_cmd = c
 		append_chunk(g, payload)
-		if c.more {
+		// chunking only applies to data sent inline; file and shm names come whole
+		if c.more && c.medium == 'd' {
 			g.loading = true
 			return
 		}
@@ -360,13 +363,15 @@ finish_transmit :: proc(t: ^Term, c: Gfx_Cmd) {
 		add_frame(t, c, rgba, w, h)
 		return
 	}
-	if c.id == 0 {
-		// numbered images get an id the client can learn from the reply
-		g.next_id += 1
-		for find_image(g, g.next_id | 0x80000000) != nil do g.next_id += 1
-		c.id = g.next_id | 0x80000000 if c.number != 0 else 0
+	// images without an id get an internal one; numbered ones learn it from the reply
+	stored := c.id
+	if stored == 0 {
+		g.next_id = (g.next_id + 1) & 0x3fffffff
+		for find_image(g, g.next_id | 0x80000000) != nil do g.next_id = (g.next_id + 1) & 0x3fffffff
+		stored = g.next_id | 0x80000000
+		if c.number != 0 do c.id = stored
 	}
-	if old := find_image(g, c.id); old != nil && c.id != 0 {
+	if old := find_image(g, stored); old != nil {
 		before := image_bytes(old)
 		for f in old.anim.extra do delete(f.rgba)
 		clear(&old.anim.extra)
@@ -383,7 +388,7 @@ finish_transmit :: proc(t: ^Term, c: Gfx_Cmd) {
 		old.used = g.budget.clock
 	} else {
 		img := new(Image)
-		img^ = {id = c.id, number = c.number, w = w, h = h, rgba = rgba}
+		img^ = {id = stored, number = c.number, w = w, h = h, rgba = rgba, anonymous = c.id == 0 && c.number == 0, opaque = c.format == 24}
 		g.budget.serial += 1
 		img.serial = g.budget.serial
 		g.budget.clock += 1
@@ -393,9 +398,33 @@ finish_transmit :: proc(t: ^Term, c: Gfx_Cmd) {
 	}
 	enforce_quota(g.budget)
 	g.changed = true
-	img := find_image(g, c.id)
-	if c.action == 'T' && img != nil do place(t, img, c)
+	img := find_image(g, stored)
+	if c.action == 'T' && img != nil {
+		pc := c
+		pc.id = stored
+		place(t, img, pc)
+	}
+	prune_anonymous(g)
 	gfx_reply(t, c, "OK")
+}
+
+// images nobody can name again go once nothing shows them; an opaque anonymous
+// frame placed exactly over an older one hides it for good
+prune_anonymous :: proc(g: ^Graphics) {
+	#reverse for p, i in g.placements {
+		if i == len(g.placements) - 1 do continue
+		top := g.placements[len(g.placements) - 1]
+		newest := find_image(g, top.image)
+		if newest == nil || !newest.anonymous || !newest.opaque do break
+		old := find_image(g, p.image)
+		if old == nil || !old.anonymous do continue
+		if p.line == top.line && p.col == top.col && p.cols == top.cols && p.rows == top.rows && p.alt == top.alt && p.z == top.z && p.off == top.off {
+			ordered_remove(&g.placements, i)
+		}
+	}
+	#reverse for img, i in g.images {
+		if img.anonymous && !image_used(g, img.id) do drop_image(g, i)
+	}
 }
 
 @(private)
@@ -598,6 +627,7 @@ graphics_delete :: proc(t: ^Term, c: Gfx_Cmd) {
 			g.changed = true
 		}
 	}
+	prune_anonymous(g)
 	if !free_data do return
 	// uppercase variants free images that no placement uses anymore
 	if lower == 'i' || lower == 'n' do append(&touched, target_id)
@@ -611,17 +641,21 @@ graphics_delete :: proc(t: ^Term, c: Gfx_Cmd) {
 // placements whose last row scrolled out of history go away
 graphics_drop_before :: proc(t: ^Term, line: int) {
 	g := &t.gfx
+	removed := false
 	#reverse for p, i in g.placements {
 		if !p.alt && !p.virtual && p.line + p.rows <= line {
 			ordered_remove(&g.placements, i)
+			removed = true
 			g.changed = true
 		}
 	}
+	if removed do prune_anonymous(g)
 }
 
 // moves placements inside a scrolled region of the active screen; n < 0 scrolls up
 graphics_scroll :: proc(t: ^Term, top, bot, n: int) {
 	g := &t.gfx
+	removed := false
 	alt := t.scr == &t.alt
 	base := t.hist.total
 	#reverse for &p, i in g.placements {
@@ -631,24 +665,29 @@ graphics_scroll :: proc(t: ^Term, top, bot, n: int) {
 		y += n
 		if y + p.rows <= top || y > bot {
 			ordered_remove(&g.placements, i)
+			removed = true
 		} else {
 			p.line = base + y
 		}
 		g.changed = true
 	}
+	if removed do prune_anonymous(g)
 }
 
 // a full screen erase removes the placements on it
 graphics_clear_screen :: proc(t: ^Term) {
 	g := &t.gfx
+	removed := false
 	alt := t.scr == &t.alt
 	base := t.hist.total
 	#reverse for p, i in g.placements {
 		if p.alt == alt && !p.virtual && p.line + p.rows > base {
 			ordered_remove(&g.placements, i)
+			removed = true
 			g.changed = true
 		}
 	}
+	if removed do prune_anonymous(g)
 }
 
 graphics_resize :: proc(t: ^Term, alt_delta: int) {
