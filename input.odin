@@ -81,6 +81,11 @@ on_key :: proc "c" (w: glfw.WindowHandle, key, scancode, action, mods: i32) {
 	if key == glfw.KEY_LEFT_CONTROL || key == glfw.KEY_RIGHT_CONTROL do update_hover(app)
 	if action == glfw.RELEASE do return
 	app.skip_char = false
+	if app.ov.open {
+		overview_key(app, key, m)
+		if !app.ov.renaming do app.skip_char = true
+		return
+	}
 	if fp := focused(app); fp != nil && fp.searching && search_key(app, fp, key, m) {
 		app.skip_char = true
 		return
@@ -109,6 +114,10 @@ on_char :: proc "c" (w: glfw.WindowHandle, ch: rune) {
 	context = app.ctx
 	if app.skip_char {
 		app.skip_char = false
+		return
+	}
+	if app.ov.open {
+		overview_char(app, ch)
 		return
 	}
 	p := focused(app)
@@ -216,6 +225,10 @@ run_action :: proc(app: ^App, action: Action) -> bool {
 		switch_space(app, app.space + 1)
 	case .Prev_Workspace:
 		switch_space(app, app.space - 1)
+	case .Overview:
+		overview_toggle(app)
+	case .Jump_Waiting:
+		jump_waiting(app)
 	case:
 		return pane_action(app, action)
 	}
@@ -295,6 +308,10 @@ on_mouse_button :: proc "c" (w: glfw.WindowHandle, button, action, mods: i32) {
 	app := app_of(w)
 	context = app.ctx
 	app.mods = to_mods(mods)
+	if app.ov.open {
+		overview_button(app, button, action)
+		return
+	}
 	mx, my := mouse_px(app)
 	if action == glfw.PRESS && my < f64(bar_height(app)) {
 		for h in app.tab_hits do if f32(mx) >= h.x0 && f32(mx) < h.x1 do switch_tab(app, h.tab)
@@ -392,6 +409,10 @@ on_cursor_pos :: proc "c" (w: glfw.WindowHandle, x, y: f64) {
 	app := app_of(w)
 	context = app.ctx
 	app.mouse_x, app.mouse_y = x, y
+	if app.ov.open {
+		overview_motion(app)
+		return
+	}
 	mx, my := mouse_px(app)
 	if app.drag_split != nil {
 		drag_divider(app, app.drag_split, int(mx), int(my))
@@ -431,6 +452,10 @@ on_cursor_pos :: proc "c" (w: glfw.WindowHandle, x, y: f64) {
 on_scroll :: proc "c" (w: glfw.WindowHandle, dx, dy: f64) {
 	app := app_of(w)
 	context = app.ctx
+	if app.ov.open {
+		overview_scroll(app, dy)
+		return
+	}
 	p := mouse_pane(app)
 	if p == nil do return
 	app.scroll_acc += dy

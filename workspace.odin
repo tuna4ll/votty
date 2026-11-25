@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:strings"
+import "core:time"
 import "term"
 import "vendor:glfw"
 
@@ -22,9 +23,63 @@ Tab :: struct {
 	focus: ^Node,
 }
 
+// a workspace is a node on the overview canvas
 Workspace :: struct {
-	tabs: [dynamic]^Tab,
-	cur:  int,
+	tabs:      [dynamic]^Tab,
+	cur:       int,
+	id:        int, // stable, used by votty ctl
+	name:      [dynamic]u8,
+	pos:       [2]f32, // canvas position at zoom 1
+	attention: bool, // something happened the user has not seen
+	note:      [dynamic]u8, // last notification text
+	exit_code: int,
+	has_exit:  bool,
+	duration:  time.Duration,
+}
+
+Node_Status :: enum u8 {
+	Idle,
+	Running,
+	Done,
+	Failed,
+	Waiting,
+}
+
+// what a node shows on the overview, from its panes
+space_status :: proc(ws: ^Workspace) -> (st: Node_Status, progress: term.Progress) {
+	running := false
+	for t in ws.tabs do for n in tab_panes(t) {
+		p := n.pane
+		sh := &p.vt.shell
+		if sh.state == .Running || (sh.state == .Unknown && time.tick_since(p.out_tick) < 1500 * time.Millisecond && p.out_tick != {}) do running = true
+		if p.vt.progress.state != 0 do progress = p.vt.progress
+	}
+	switch {
+	case ws.attention:
+		st = .Waiting
+	case running:
+		st = .Running
+	case ws.has_exit:
+		st = .Done if ws.exit_code == 0 else .Failed
+	}
+	return
+}
+
+space_of :: proc(app: ^App, id: int) -> ^Workspace {
+	for ws in app.spaces do if ws.id == id do return ws
+	return nil
+}
+
+space_index :: proc(app: ^App, ws: ^Workspace) -> int {
+	for s, i in app.spaces do if s == ws do return i
+	return -1
+}
+
+free_space :: proc(ws: ^Workspace) {
+	delete(ws.tabs)
+	delete(ws.name)
+	delete(ws.note)
+	free(ws)
 }
 
 Dir :: enum u8 {
@@ -91,11 +146,12 @@ tab_area :: proc(app: ^App) -> (x, y, w, h: int) {
 	return 0, bh, int(fw), int(fh) - bh
 }
 
-make_leaf :: proc(app: ^App, w, h: int, cwd := "") -> ^Node {
+make_leaf :: proc(app: ^App, w, h: int, cwd := "", command: []string = nil) -> ^Node {
 	cols := max((w - 2 * PAD) / app.f.cell_w, 1)
 	rows := max((h - 2 * PAD) / app.f.cell_h, 1)
-	p := pane_open(app, cols, rows, cwd)
+	p := pane_open(app, cols, rows, cwd, command)
 	if p == nil do return nil
+	p.space = cur_space(app)
 	n := new(Node)
 	n.pane = p
 	p.node = n
@@ -128,24 +184,38 @@ new_tab :: proc(app: ^App) -> bool {
 	return true
 }
 
-new_workspace :: proc(app: ^App) -> bool {
-	cwd := focused_cwd(app)
-	append(&app.spaces, new(Workspace))
-	app.space = len(app.spaces) - 1
-	ws := app.spaces[app.space]
-	_, _, w, h := tab_area(app)
-	n := make_leaf(app, w, h, cwd)
-	if n == nil {
-		free(pop(&app.spaces))
-		app.space = max(len(app.spaces) - 1, 0)
-		return false
+// opens a node; it becomes the current workspace unless activate is false
+new_workspace :: proc(app: ^App, cwd := "", command: []string = nil, name := "", activate := true) -> ^Workspace {
+	dir := cwd if cwd != "" else focused_cwd(app)
+	prev := app.space
+	ws := new(Workspace)
+	app.next_id += 1
+	ws.id = app.next_id
+	append(&ws.name, name if name != "" else fmt.tprintf("node %d", ws.id))
+	// place it next to the last node on the canvas
+	if len(app.spaces) > 0 {
+		last := app.spaces[len(app.spaces) - 1].pos
+		ws.pos = {last.x + 420, last.y}
+		if ws.pos.x > 900 do ws.pos = {0, last.y + 340}
 	}
+	append(&app.spaces, ws)
+	app.space = len(app.spaces) - 1
+	_, _, w, h := tab_area(app)
+	n := make_leaf(app, w, h, dir, command)
+	if n == nil {
+		pop(&app.spaces)
+		free_space(ws)
+		app.space = clamp(prev, 0, max(len(app.spaces) - 1, 0))
+		return nil
+	}
+	n.pane.space = ws
 	t := new(Tab)
 	t.root = n
 	t.focus = n
 	append(&ws.tabs, t)
+	if !activate do app.space = prev
 	layout(app)
-	return true
+	return ws
 }
 
 split :: proc(app: ^App, stack: bool) {
@@ -206,9 +276,9 @@ remove_pane :: proc(app: ^App, p: ^Pane) {
 				}
 			}
 			if len(ws.tabs) == 0 {
-				delete(ws.tabs)
-				free(ws)
+				if app.ov.sel == ws do app.ov.sel = nil
 				ordered_remove(&app.spaces, wi)
+				free_space(ws)
 				app.space = clamp(app.space, 0, max(len(app.spaces) - 1, 0))
 			}
 			if app.drag == p do app.drag = nil
@@ -335,6 +405,8 @@ switch_tab :: proc(app: ^App, i: int) {
 switch_space :: proc(app: ^App, i: int) {
 	if len(app.spaces) == 0 do return
 	app.space = (i + len(app.spaces)) % len(app.spaces)
+	// looking at a node acknowledges what happened there
+	app.spaces[app.space].attention = false
 	layout(app)
 }
 
@@ -368,7 +440,7 @@ draw_tab_bar :: proc(app: ^App) {
 		if len(title) > 24 do title = title[:24]
 		append(&labels, fmt.tprintf(" %d %s ", i + 1, title))
 	}
-	space := fmt.tprintf(" workspace %d/%d ", app.space + 1, len(app.spaces))
+	space := fmt.tprintf(" %s  %d/%d ", string(ws.name[:]), app.space + 1, len(app.spaces))
 	x: f32 = 0
 	for l, i in labels {
 		w := f32(text_width(f, l))

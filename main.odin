@@ -29,6 +29,12 @@ Pane :: struct {
 	query:      [dynamic]u8,
 	node:       ^Node,
 	sync_since: time.Tick,
+	space:      ^Workspace,
+	out_tick:   time.Tick, // last output, for shells without prompt marks
+	cmd_tick:   time.Tick, // when the running command started
+	seen:       struct {
+		started, finished, notify: u64,
+	},
 }
 
 Sel_Mode :: enum u8 {
@@ -51,6 +57,8 @@ App :: struct {
 	r:           Renderer,
 	f:           Fonts,
 	spaces:      [dynamic]^Workspace,
+	next_id:     int,
+	ov:          Overview,
 	space:       int,
 	drag:        ^Pane, // pane receiving a mouse drag
 	drag_split:  ^Node, // split whose divider is being dragged
@@ -179,8 +187,10 @@ pane_pump :: proc(app: ^App, p: ^Pane) -> bool {
 	eof := term.pty_take(p.pty, &p.buf)
 	if len(p.buf) > 0 {
 		term.feed(p.vt, p.buf[:])
+		p.out_tick = time.tick_now()
 		app.dirty = true
 	}
+	pane_events(app, p)
 	if p.vt.gfx.changed {
 		p.vt.gfx.changed = false
 		app.dirty = true
@@ -212,6 +222,39 @@ pane_pump :: proc(app: ^App, p: ^Pane) -> bool {
 	}
 	if eof && term.pty_reap(p.pty) do return false
 	return !eof
+}
+
+// turns shell marks, bells and notifications into node state
+pane_events :: proc(app: ^App, p: ^Pane) {
+	t := p.vt
+	ws := p.space
+	if ws == nil do return
+	unseen := !app.focused || ws != cur_space(app) || app.ov.open
+	sh := &t.shell
+	if sh.started != p.seen.started {
+		p.seen.started = sh.started
+		p.cmd_tick = time.tick_now()
+		ws.has_exit = false
+		app.dirty = true
+	}
+	if sh.finished != p.seen.finished {
+		p.seen.finished = sh.finished
+		ws.exit_code = sh.exit_code
+		ws.has_exit = true
+		ws.duration = time.tick_since(p.cmd_tick) if p.cmd_tick != {} else 0
+		app.dirty = true
+	}
+	if t.notify_seq != p.seen.notify {
+		p.seen.notify = t.notify_seq
+		clear(&ws.note)
+		append(&ws.note, ..t.notify[:])
+		if unseen do ws.attention = true
+		app.dirty = true
+	}
+	if t.bell && unseen {
+		ws.attention = true
+		app.dirty = true
+	}
 }
 
 draw_pane :: proc(app: ^App, p: ^Pane, focused: bool) {
@@ -382,6 +425,13 @@ render :: proc(app: ^App) {
 	w, h := glfw.GetFramebufferSize(app.win)
 	fp := focused(app)
 	bg := fp.vt.bg if fp != nil else app.cfg.bg
+	if app.ov.open {
+		draw_overview(app, int(w), int(h))
+		end_frame(&app.r)
+		glfw.SwapBuffers(app.win)
+		app.dirty = false
+		return
+	}
 	begin_frame(&app.r, int(w), int(h), bg)
 	if t := cur_tab(app); t != nil {
 		for n in tab_panes(t) do draw_pane(app, n.pane, app.focused && n == t.focus)
@@ -519,11 +569,12 @@ main :: proc() {
 	defer delete(app.hover.url)
 	defer for c in app.cursors do if c != nil do glfw.DestroyCursor(c)
 	install_callbacks(app)
-	if !new_workspace(app) do os.exit(1)
+	if new_workspace(app) == nil do os.exit(1)
 	defer {
 		for len(app.spaces) > 0 do close_workspace(app)
 		delete(app.spaces)
 		delete(app.tab_hits)
+		overview_free(app)
 	}
 	app.blink_on = true
 	app.focused = true

@@ -39,6 +39,8 @@ Action :: enum u8 {
 	Close_Workspace,
 	Next_Workspace,
 	Prev_Workspace,
+	Overview,
+	Jump_Waiting,
 }
 
 Binding :: struct {
@@ -112,6 +114,8 @@ DEFAULT_BINDINGS := [?]struct {
 	{"ctrl+shift+x", .Close_Workspace},
 	{"ctrl+shift+page_down", .Next_Workspace},
 	{"ctrl+shift+page_up", .Prev_Workspace},
+	{"ctrl+shift+space", .Overview},
+	{"ctrl+shift+a", .Jump_Waiting},
 }
 
 KEY_NAMES := [?]struct {

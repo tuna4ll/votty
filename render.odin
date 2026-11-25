@@ -128,6 +128,9 @@ void main() {
 	} else if (u_mode == 3) {
 		color = texelFetch(u_tex, ivec2(v_uv), 0) * v_color.a;
 		if (color.a <= 0.0) discard;
+	} else if (u_mode == 4) {
+		// already premultiplied, e.g. an offscreen render
+		color = texture(u_tex, v_uv) * v_color.a;
 	} else {
 		vec4 t = texture(u_tex, v_uv);
 		color = vec4(t.rgb * t.a, t.a) * v_color.a;
@@ -155,6 +158,53 @@ Rect_Mode :: enum i32 {
 	Glyph,
 	Image,
 	Color_Glyph,
+	Premultiplied,
+}
+
+// an offscreen color target, mipmapped so it can be shown small
+Target :: struct {
+	fbo, tex: u32,
+	w, h:     int,
+}
+
+target_free :: proc(t: ^Target) {
+	if t.fbo != 0 do gl.DeleteFramebuffers(1, &t.fbo)
+	if t.tex != 0 do gl.DeleteTextures(1, &t.tex)
+	t^ = {}
+}
+
+// binds a target sized w x h for drawing, reallocating when the size changed
+target_begin :: proc(r: ^Renderer, t: ^Target, w, h: int, bg: u32) {
+	if t.w != w || t.h != h || t.fbo == 0 {
+		target_free(t)
+		t.w, t.h = w, h
+		gl.GenTextures(1, &t.tex)
+		gl.BindTexture(gl.TEXTURE_2D, t.tex)
+		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, i32(w), i32(h), 0, gl.RGBA, gl.UNSIGNED_BYTE, nil)
+		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR)
+		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+		gl.GenFramebuffers(1, &t.fbo)
+		gl.BindFramebuffer(gl.FRAMEBUFFER, t.fbo)
+		gl.FramebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t.tex, 0)
+	}
+	gl.BindFramebuffer(gl.FRAMEBUFFER, t.fbo)
+	r.fb_w, r.fb_h = w, h
+	gl.Viewport(0, 0, i32(w), i32(h))
+	gl.Disable(gl.SCISSOR_TEST)
+	gl.ClearColor(f32((bg >> 16) & 0xff) / 255, f32((bg >> 8) & 0xff) / 255, f32(bg & 0xff) / 255, 1)
+	gl.Clear(gl.COLOR_BUFFER_BIT)
+}
+
+// returns to the window, restoring its size
+target_end :: proc(r: ^Renderer, t: ^Target, w, h: int) {
+	gl.BindTexture(gl.TEXTURE_2D, t.tex)
+	gl.GenerateMipmap(gl.TEXTURE_2D)
+	gl.BindFramebuffer(gl.FRAMEBUFFER, 0)
+	r.fb_w, r.fb_h = w, h
+	gl.Viewport(0, 0, i32(w), i32(h))
+	gl.Disable(gl.SCISSOR_TEST)
 }
 
 // gpu state for one terminal view
