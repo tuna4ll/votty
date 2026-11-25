@@ -128,6 +128,10 @@ Term :: struct {
 	title_dirty:  bool,
 	cwd:          [dynamic]u8,
 	bell:         bool,
+	shell:        Shell_Marks,
+	notify:       [dynamic]u8, // last desktop notification text
+	notify_seq:   u64, // bumped per notification
+	progress:     Progress,
 	clipboard:    [dynamic]u8,
 	clip_dirty:   bool,
 	out:          [dynamic]u8, // replies for the pty
@@ -135,6 +139,29 @@ Term :: struct {
 	theme:        Theme,
 	gfx:          Graphics,
 	output_seq:   u64, // bumped on content changes, used by search
+}
+
+Shell_State :: enum u8 {
+	Unknown, // the shell does not report prompts
+	Prompt,
+	Running,
+}
+
+// command boundaries reported by shell integration (osc 133)
+Shell_Marks :: struct {
+	state:      Shell_State,
+	out_start:  int, // absolute line where the running command's output begins
+	out_end:    int, // absolute line after the last finished command's output
+	last_start: int, // output start of the last finished command
+	exit_code:  int,
+	finished:   u64, // bumped every time a command finishes
+	started:    u64, // bumped every time a command starts
+}
+
+// osc 9;4 progress
+Progress :: struct {
+	state:   u8, // 0 none, 1 normal, 2 error, 3 indeterminate, 4 paused
+	percent: int,
 }
 
 // user defaults restored by resets
@@ -195,6 +222,7 @@ destroy_term :: proc(t: ^Term) {
 	delete(t.title)
 	delete(t.cwd)
 	delete(t.clipboard)
+	delete(t.notify)
 	delete(t.out)
 	parser_free(&t.parser)
 	graphics_free(&t.gfx)

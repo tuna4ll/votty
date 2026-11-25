@@ -835,6 +835,28 @@ osc_dispatch :: proc(t: ^Term, s: string) {
 		}
 	case 7:
 		set_cwd(t, rest)
+	case 9:
+		// 9;4;state;percent is a progress report, anything else a notification
+		if strings.has_prefix(rest, "4;") || rest == "4" {
+			f := rest[min(2, len(rest)):]
+			st, _ := strconv.parse_int(next_field(&f), 10)
+			pc, _ := strconv.parse_int(next_field(&f), 10)
+			t.progress = {u8(clamp(st, 0, 4)), clamp(pc, 0, 100)}
+		} else {
+			set_notify(t, rest)
+		}
+	case 99:
+		// kitty notifications carry metadata, then the text
+		set_notify(t, rest[strings.index_byte(rest, ';') + 1:])
+	case 777:
+		// notify;title;body
+		f := rest
+		if next_field(&f) == "notify" {
+			title := next_field(&f)
+			set_notify(t, f if f != "" else title)
+		}
+	case 133:
+		shell_mark(t, rest)
 	case 8:
 		// params;uri, an empty uri ends the link
 		semi2 := strings.index_byte(rest, ';')
@@ -874,6 +896,51 @@ osc_dispatch :: proc(t: ^Term, s: string) {
 	case 112:
 		t.cursor_color = t.theme.cursor_color
 	}
+}
+
+@(private)
+set_notify :: proc(t: ^Term, text: string) {
+	clear(&t.notify)
+	append(&t.notify, text[:min(len(text), 512)])
+	t.notify_seq += 1
+}
+
+@(private)
+shell_mark :: proc(t: ^Term, s: string) {
+	rest := s
+	kind := next_field(&rest)
+	sh := &t.shell
+	line := t.hist.total + t.cur.y
+	switch kind {
+	case "A", "B":
+		// a prompt after output without D still ends that command
+		if sh.state == .Running {
+			sh.last_start, sh.out_end = sh.out_start, line
+			sh.finished += 1
+		}
+		sh.state = .Prompt
+	case "C":
+		sh.state = .Running
+		sh.out_start = line
+		sh.started += 1
+	case "D":
+		if sh.state == .Running {
+			sh.last_start = sh.out_start
+			sh.out_end = line + (1 if t.cur.x > 0 else 0)
+			code := next_field(&rest)
+			sh.exit_code, _ = strconv.parse_int(code, 10)
+			sh.finished += 1
+		}
+		sh.state = .Prompt
+	}
+}
+
+// text of the last finished command's output
+last_output :: proc(t: ^Term, allocator := context.allocator) -> string {
+	sh := &t.shell
+	if sh.finished == 0 || sh.out_end <= sh.last_start do return ""
+	s := selection_text(t, {sh.last_start, 0}, {sh.out_end - 1, t.cols - 1}, allocator)
+	return strings.trim_right(s, "\n ")
 }
 
 @(private)

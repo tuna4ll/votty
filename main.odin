@@ -105,15 +105,21 @@ default_shell :: proc() -> string {
 	return strings.clone("/bin/sh")
 }
 
-pane_open :: proc(app: ^App, cols, rows: int, cwd: string = "") -> ^Pane {
+pane_open :: proc(app: ^App, cols, rows: int, cwd: string = "", command: []string = nil) -> ^Pane {
 	p := new(Pane)
 	p.vt = term.make_term(cols, rows, app.cfg.scrollback, &app.images)
 	term.set_cell_size(p.vt, app.f.cell_w, app.f.cell_h)
 	term.set_theme(p.vt, theme_of(&app.cfg))
-	env := []string{"TERM=xterm-256color", "COLORTERM=truecolor", "TERM_PROGRAM=votty"}
+	env := make([dynamic]string, context.temp_allocator)
+	append(&env, "TERM=xterm-256color", "COLORTERM=truecolor", "TERM_PROGRAM=votty")
 	ws := term.Winsize{u16(rows), u16(cols), u16(cols * app.f.cell_w), u16(rows * app.f.cell_h)}
-	argv := app.command if len(app.command) > 0 else []string{app.shell}
-	pty, ok := term.pty_spawn(argv, env, ws, notify_main, nil, cwd)
+	argv := command
+	if len(argv) == 0 do argv = app.command
+	if len(argv) == 0 {
+		argv = []string{app.shell}
+		if app.cfg.integration do argv = shell_integration(argv, &env)
+	}
+	pty, ok := term.pty_spawn(argv, env[:], ws, notify_main, nil, cwd)
 	if !ok {
 		fmt.eprintln("votty: cannot spawn", app.shell)
 		term.destroy_term(p.vt)
