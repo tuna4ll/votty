@@ -195,8 +195,8 @@ new_workspace :: proc(app: ^App, cwd := "", command: []string = nil, name := "",
 	// place it next to the last node on the canvas
 	if len(app.spaces) > 0 {
 		last := app.spaces[len(app.spaces) - 1].pos
-		ws.pos = {last.x + 420, last.y}
-		if ws.pos.x > 900 do ws.pos = {0, last.y + 340}
+		ws.pos = {last.x + 500, last.y}
+		if ws.pos.x > 1000 do ws.pos = {0, last.y + 380}
 	}
 	append(&app.spaces, ws)
 	app.space = len(app.spaces) - 1
@@ -277,6 +277,7 @@ remove_pane :: proc(app: ^App, p: ^Pane) {
 			}
 			if len(ws.tabs) == 0 {
 				if app.ov.sel == ws do app.ov.sel = nil
+				remove_edges(app, ws.id)
 				ordered_remove(&app.spaces, wi)
 				free_space(ws)
 				app.space = clamp(app.space, 0, max(len(app.spaces) - 1, 0))

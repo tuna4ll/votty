@@ -25,8 +25,14 @@ Overview :: struct {
 	grab_pos:  [2]f32, // node position or pan when the drag began
 	moved:     bool,
 	click_at:  f64,
-	renaming:  bool,
+	renaming:  bool, // editing text: a node name, or an after edge command
 	fresh:     bool, // the first typed char replaces the old name
+	link:      struct {
+		active: bool,
+		kind:   Edge_Kind,
+		from:   int,
+		to:     int, // target waiting for its command
+	},
 	edit:      [dynamic]u8,
 	close_at:  time.Tick, // first press of a two step close
 }
@@ -183,10 +189,14 @@ draw_overview :: proc(app: ^App, w, h: int) {
 		for y := oy; y < f32(h); y += step do for x := ox; x < f32(w); x += step do push_rect(r, x, y, 2, 2, pack(0x2a2d35, 1))
 		flush_rects(r, .Solid)
 	}
+	labels := make([dynamic]Edge_Label, context.temp_allocator)
+	draw_edges(app, &labels)
 	for ws in app.spaces do draw_card(app, ws, w, h)
+	draw_edge_labels(app, labels[:])
 	// key help along the bottom
-	help := "enter open · n new · r rename · x close · shift+arrows move · ctrl+shift+a waiting · esc"
-	if ov.renaming do help = "type a name  enter save  esc cancel"
+	help := "enter open · n new · r rename · p pipe · a after · u unlink · s send · x close · shift+arrows move · esc"
+	if ov.renaming do help = "type a command  enter link  esc cancel" if ov.link.to != 0 else "type a name  enter save  esc cancel"
+	if ov.link.active do help = "pick the target with the arrows  enter link  esc cancel"
 	bh := f32(f.cell_h + 6)
 	push_rect(r, 0, f32(h) - bh, f32(w), bh, pack(0x1c1e24, 0.95))
 	flush_rects(r, .Solid)
@@ -276,13 +286,17 @@ overview_key :: proc(app: ^App, key: i32, m: term.Mods) {
 	if ov.renaming {
 		switch key {
 		case glfw.KEY_ENTER, glfw.KEY_KP_ENTER:
-			if ov.sel != nil && len(ov.edit) > 0 {
+			if ov.link.to != 0 {
+				if len(ov.edit) > 0 do add_edge(app, ov.link.from, ov.link.to, .After, string(ov.edit[:]))
+				ov.link = {}
+			} else if ov.sel != nil && len(ov.edit) > 0 {
 				clear(&ov.sel.name)
 				append(&ov.sel.name, ..ov.edit[:])
 			}
 			ov.renaming = false
 		case glfw.KEY_ESCAPE:
 			ov.renaming = false
+			ov.link = {}
 		case glfw.KEY_BACKSPACE:
 			ov.fresh = false
 			n := len(ov.edit)
@@ -292,6 +306,11 @@ overview_key :: proc(app: ^App, key: i32, m: term.Mods) {
 			}
 			resize(&ov.edit, n)
 		}
+		return
+	}
+	if ov.link.active && (key == glfw.KEY_ESCAPE || key == glfw.KEY_ENTER || key == glfw.KEY_KP_ENTER) {
+		if key != glfw.KEY_ESCAPE do finish_link(app)
+		ov.link.active = false
 		return
 	}
 	action := lookup_binding(&app.cfg, key, m)
@@ -336,6 +355,14 @@ overview_key :: proc(app: ^App, key: i32, m: term.Mods) {
 			append(&ov.edit, ..sel.name[:])
 			app.skip_char = true
 		}
+	case glfw.KEY_P, glfw.KEY_A:
+		// pick a target with the arrows, enter links it
+		if sel == nil do return
+		ov.link = {active = true, kind = .Pipe if key == glfw.KEY_P else .After, from = sel.id}
+	case glfw.KEY_U:
+		if sel != nil do remove_edges(app, sel.id, from_only = true)
+	case glfw.KEY_S:
+		if sel != nil do send_output(app, sel)
 	case glfw.KEY_X, glfw.KEY_DELETE:
 		// closing kills the shells, so it takes a second press
 		if sel == nil do return
@@ -441,3 +468,205 @@ jump_waiting :: proc(app: ^App) {
 		return
 	}
 }
+
+Edge_Kind :: enum u8 {
+	Pipe, // send output on request
+	After, // run a command when the source succeeds
+}
+
+Edge :: struct {
+	from, to: int, // node ids
+	kind:     Edge_Kind,
+	command:  [dynamic]u8,
+}
+
+add_edge :: proc(app: ^App, from, to: int, kind: Edge_Kind, command := "") -> bool {
+	if from == to || space_of(app, from) == nil || space_of(app, to) == nil do return false
+	for &e in app.edges {
+		if e.from == from && e.to == to && e.kind == kind {
+			clear(&e.command)
+			append(&e.command, command)
+			return true
+		}
+	}
+	e := Edge{from = from, to = to, kind = kind}
+	append(&e.command, command)
+	append(&app.edges, e)
+	app.dirty = true
+	return true
+}
+
+// drops edges touching a node, or only those leaving it
+remove_edges :: proc(app: ^App, id: int, from_only := false) {
+	#reverse for &e, i in app.edges {
+		if e.from == id || (!from_only && e.to == id) {
+			delete(e.command)
+			ordered_remove(&app.edges, i)
+		}
+	}
+	app.dirty = true
+}
+
+edges_free :: proc(app: ^App) {
+	for &e in app.edges do delete(e.command)
+	delete(app.edges)
+}
+
+finish_link :: proc(app: ^App) {
+	ov := &app.ov
+	if ov.sel == nil || ov.sel.id == ov.link.from do return
+	if ov.link.kind == .Pipe {
+		add_edge(app, ov.link.from, ov.sel.id, .Pipe)
+		return
+	}
+	// an after edge needs the command it will run
+	ov.link.to = ov.sel.id
+	ov.renaming = true
+	ov.fresh = false
+	clear(&ov.edit)
+}
+
+set_note :: proc(ws: ^Workspace, text: string) {
+	clear(&ws.note)
+	append(&ws.note, text)
+}
+
+// what a node offers downstream: its selection, else its last command output
+node_output :: proc(ws: ^Workspace) -> string {
+	t := ws.tabs[ws.cur]
+	if t == nil || t.focus == nil do return ""
+	p := t.focus.pane
+	if p.sel.active do return term.selection_text(p.vt, p.sel.a, p.sel.b, context.temp_allocator)
+	return term.last_output(p.vt, context.temp_allocator)
+}
+
+node_input :: proc(app: ^App, ws: ^Workspace, data: []u8) {
+	t := ws.tabs[ws.cur]
+	if t == nil || t.focus == nil do return
+	term.pty_write(t.focus.pane.pty, data)
+	app.dirty = true
+}
+
+// pastes a node's output into every node its pipe edges point at
+send_output :: proc(app: ^App, ws: ^Workspace) {
+	text := node_output(ws)
+	if text == "" {
+		set_note(ws, "nothing to send: select text or finish a command")
+		return
+	}
+	sent := 0
+	for e in app.edges {
+		if e.from != ws.id || e.kind != .Pipe do continue
+		dst := space_of(app, e.to)
+		if dst == nil do continue
+		t := dst.tabs[dst.cur]
+		if t == nil || t.focus == nil do continue
+		out := make([dynamic]u8, context.temp_allocator)
+		term.encode_paste(t.focus.pane.vt, text, &out)
+		node_input(app, dst, out[:])
+		set_note(dst, fmt.tprintf("received %d bytes from %s", len(text), string(ws.name[:])))
+		dst.attention = dst != cur_space(app) || app.ov.open
+		sent += 1
+	}
+	set_note(ws, fmt.tprintf("sent to %d node%s", sent, "" if sent == 1 else "s") if sent > 0 else "no pipe edges from this node")
+}
+
+// a finished command starts the after edges of its node when it succeeded
+run_after_edges :: proc(app: ^App, ws: ^Workspace, code: int) {
+	if code != 0 do return
+	for e in app.edges {
+		if e.from != ws.id || e.kind != .After do continue
+		dst := space_of(app, e.to)
+		if dst == nil do continue
+		cmd := fmt.tprintf("%s\r", string(e.command[:]))
+		node_input(app, dst, transmute([]u8)cmd)
+		set_note(dst, fmt.tprintf("started by %s", string(ws.name[:])))
+	}
+}
+
+Edge_Label :: struct {
+	x, y:  f32,
+	text:  string,
+	color: u32,
+}
+
+@(private = "file")
+hits_card :: proc(app: ^App, skip_a, skip_b: ^Workspace, x0, y0, x1, y1: f32) -> bool {
+	for c in app.spaces {
+		if c == skip_a || c == skip_b do continue
+		cx, cy, cw, ch, _ := card_rect(app, c)
+		if min(x0, x1) < cx + cw && max(x0, x1) > cx && min(y0, y1) < cy + ch && max(y0, y1) > cy do return true
+	}
+	return false
+}
+
+// an elbow connector between two cards, routed over the top when a card is in the way
+@(private = "file")
+draw_connector :: proc(app: ^App, a, b: ^Workspace, color: u32) -> (lx, ly: f32) {
+	r := &app.r
+	s := ov_scale(app)
+	th := max(2 * s, 1.5)
+	ax, ay, aw, ah, _ := card_rect(app, a)
+	bx, by, bw, bh, _ := card_rect(app, b)
+	sx, sy := ax + aw, ay + ah / 2
+	ex, ey := bx, by + bh / 2
+	midx := (sx + ex) / 2
+	if ex > sx && !hits_card(app, a, b, sx, sy, midx, sy + th) && !hits_card(app, a, b, midx, sy, midx + th, ey) && !hits_card(app, a, b, midx, ey, ex, ey + th) {
+		push_rect(r, sx, sy - th / 2, midx - sx, th, color)
+		push_rect(r, midx - th / 2, min(sy, ey) - th / 2, th, abs(ey - sy) + th, color)
+		push_rect(r, midx, ey - th / 2, ex - midx, th, color)
+		push_rect(r, ex - 5 * th, ey - 3 * th, 5 * th, 6 * th, color)
+		return midx, (sy + ey) / 2
+	}
+	// over the top: up from the source, across above every card in between, down into the target
+	sx, sy = ax + aw / 2, ay
+	ex, ey = bx + bw / 2, by
+	top := min(ay, by)
+	for c in app.spaces {
+		cx, cy, cw, _, _ := card_rect(app, c)
+		if cx < max(sx, ex) && cx + cw > min(sx, ex) do top = min(top, cy)
+	}
+	top -= 28 * s
+	push_rect(r, sx - th / 2, top, th, sy - top, color)
+	push_rect(r, min(sx, ex) - th / 2, top - th / 2, abs(ex - sx) + th, th, color)
+	push_rect(r, ex - th / 2, top, th, ey - top, color)
+	push_rect(r, ex - 3 * th, ey - 5 * th, 6 * th, 5 * th, color)
+	return (sx + ex) / 2, top
+}
+
+// connectors go under the cards, their labels on top
+draw_edges :: proc(app: ^App, labels: ^[dynamic]Edge_Label) {
+	r := &app.r
+	ov := &app.ov
+	for e in app.edges {
+		a, b := space_of(app, e.from), space_of(app, e.to)
+		if a == nil || b == nil do continue
+		color := u32(0x6ab0f3) if e.kind == .Pipe else 0x7ec87a
+		lx, ly := draw_connector(app, a, b, pack(color, 0.9))
+		text := "pipe" if e.kind == .Pipe else fmt.tprintf("after: %s", string(e.command[:]))
+		if len(text) > 32 do text = fmt.tprintf("%s…", text[:31])
+		append(labels, Edge_Label{lx, ly, text, color})
+	}
+	// the edge being drawn follows the selection
+	if ov.link.active {
+		if a := space_of(app, ov.link.from); a != nil && ov.sel != nil && ov.sel != a {
+			draw_connector(app, a, ov.sel, pack(0xf0c070, 0.9))
+		}
+	}
+	flush_rects(r, .Solid)
+}
+
+draw_edge_labels :: proc(app: ^App, labels: []Edge_Label) {
+	r := &app.r
+	f := &app.f
+	for l in labels {
+		w := f32(text_width(f, l.text))
+		push_rect(r, l.x - w / 2 - 5, l.y - f32(f.cell_h) / 2 - 2, w + 10, f32(f.cell_h) + 4, pack(0x121317, 0.95))
+		push_rect(r, l.x - w / 2 - 5, l.y - f32(f.cell_h) / 2 - 2, w + 10, 1, pack(l.color, 0.6))
+	}
+	flush_rects(r, .Solid)
+	for l in labels do draw_text(r, f, l.x - f32(text_width(f, l.text)) / 2, l.y - f32(f.cell_h) / 2, l.text, pack(l.color, 1))
+	flush_glyphs(r, f)
+}
+
+card_w :: proc(app: ^App) -> f32 {return CARD_W * ov_scale(app)}

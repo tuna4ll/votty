@@ -59,6 +59,7 @@ App :: struct {
 	spaces:      [dynamic]^Workspace,
 	next_id:     int,
 	ov:          Overview,
+	edges:       [dynamic]Edge,
 	space:       int,
 	drag:        ^Pane, // pane receiving a mouse drag
 	drag_split:  ^Node, // split whose divider is being dragged
@@ -243,6 +244,7 @@ pane_events :: proc(app: ^App, p: ^Pane) {
 		ws.has_exit = true
 		ws.duration = time.tick_since(p.cmd_tick) if p.cmd_tick != {} else 0
 		app.dirty = true
+		run_after_edges(app, ws, sh.exit_code)
 	}
 	if t.notify_seq != p.seen.notify {
 		p.seen.notify = t.notify_seq
@@ -575,6 +577,7 @@ main :: proc() {
 		delete(app.spaces)
 		delete(app.tab_hits)
 		overview_free(app)
+		edges_free(app)
 	}
 	app.blink_on = true
 	app.focused = true

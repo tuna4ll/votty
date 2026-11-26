@@ -229,6 +229,8 @@ run_action :: proc(app: ^App, action: Action) -> bool {
 		overview_toggle(app)
 	case .Jump_Waiting:
 		jump_waiting(app)
+	case .Send_Output:
+		if ws := cur_space(app); ws != nil do send_output(app, ws)
 	case:
 		return pane_action(app, action)
 	}
