@@ -60,6 +60,7 @@ App :: struct {
 	next_id:     int,
 	ov:          Overview,
 	edges:       [dynamic]Edge,
+	ctl:         Ctl,
 	space:       int,
 	drag:        ^Pane, // pane receiving a mouse drag
 	drag_split:  ^Node, // split whose divider is being dragged
@@ -121,6 +122,8 @@ pane_open :: proc(app: ^App, cols, rows: int, cwd: string = "", command: []strin
 	term.set_theme(p.vt, theme_of(&app.cfg))
 	env := make([dynamic]string, context.temp_allocator)
 	append(&env, "TERM=xterm-256color", "COLORTERM=truecolor", "TERM_PROGRAM=votty")
+	if app.ctl.path != "" do append(&env, strings.concatenate({"VOTTY_SOCKET=", app.ctl.path}, context.temp_allocator))
+	if ws := cur_space(app); ws != nil do append(&env, fmt.tprintf("VOTTY_NODE=%d", ws.id))
 	ws := term.Winsize{u16(rows), u16(cols), u16(cols * app.f.cell_w), u16(rows * app.f.cell_h)}
 	argv := command
 	if len(argv) == 0 do argv = app.command
@@ -225,6 +228,30 @@ pane_pump :: proc(app: ^App, p: ^Pane) -> bool {
 	return !eof
 }
 
+// a node whose last pane exits finishes with that process's status
+pane_exited :: proc(app: ^App, p: ^Pane) {
+	ws := p.space
+	if ws == nil do return
+	for _ in 0 ..< 25 {
+		if term.pty_reap(p.pty) do break
+		time.sleep(2 * time.Millisecond)
+	}
+	code := term.exit_code(p.pty) if p.pty.reaped else -1
+	ws.exit_code = code
+	ws.has_exit = true
+	ws.finished += 1
+	run_after_edges(app, ws, code)
+	ctl_resolve(app)
+}
+
+// set from signal handlers; the main loop shuts down cleanly when it sees it
+quit_requested: b32
+
+on_quit_signal :: proc "c" (sig: posix.Signal) {
+	quit_requested = true
+	glfw.PostEmptyEvent()
+}
+
 // turns shell marks, bells and notifications into node state
 pane_events :: proc(app: ^App, p: ^Pane) {
 	t := p.vt
@@ -242,6 +269,7 @@ pane_events :: proc(app: ^App, p: ^Pane) {
 		p.seen.finished = sh.finished
 		ws.exit_code = sh.exit_code
 		ws.has_exit = true
+		ws.finished += 1
 		ws.duration = time.tick_since(p.cmd_tick) if p.cmd_tick != {} else 0
 		app.dirty = true
 		run_after_edges(app, ws, sh.exit_code)
@@ -450,7 +478,7 @@ render :: proc(app: ^App) {
 }
 
 usage :: proc() {
-	fmt.eprintln("usage: votty [-c config] [-o key=value]... [-e command args...]")
+	fmt.eprintln("usage: votty [-c config] [-o key=value]... [-e command args...]\n       votty ctl COMMAND...   (votty ctl help)")
 	os.exit(2)
 }
 
@@ -470,10 +498,12 @@ main :: proc() {
 	defer term.intern_free()
 	app.ctx = context
 	posix.signal(.SIGPIPE, auto_cast posix.SIG_IGN)
+	for sig in ([]posix.Signal{.SIGTERM, .SIGINT, .SIGHUP}) do posix.signal(sig, on_quit_signal)
 
+	args := os.args[1:]
+	if len(args) > 0 && args[0] == "ctl" do os.exit(ctl_client(args[1:]))
 	config_defaults(&app.cfg)
 	defer config_destroy(&app.cfg)
-	args := os.args[1:]
 	cfg_file := config_path()
 	overrides := make([dynamic]string, context.temp_allocator)
 	for i := 0; i < len(args); i += 1 {
@@ -571,6 +601,8 @@ main :: proc() {
 	defer delete(app.hover.url)
 	defer for c in app.cursors do if c != nil do glfw.DestroyCursor(c)
 	install_callbacks(app)
+	if !ctl_start(app) do fmt.eprintln("votty: control socket unavailable")
+	defer ctl_stop(app)
 	if new_workspace(app) == nil do os.exit(1)
 	defer {
 		for len(app.spaces) > 0 do close_workspace(app)
@@ -584,7 +616,7 @@ main :: proc() {
 	app.last_input = time.tick_now()
 	blink_at := time.tick_now()
 
-	for !glfw.WindowShouldClose(app.win) {
+	for !glfw.WindowShouldClose(app.win) && !quit_requested {
 		if app.dirty {
 			// a held synchronized update waits a little instead of spinning
 			if syncing(app) {
@@ -595,6 +627,7 @@ main :: proc() {
 		} else {
 			wait := 0.5
 			if app.anim_wait >= 0 do wait = min(wait, f64(max(app.anim_wait, 1)) / 1000)
+			if d, ok := ctl_next_deadline(app); ok do wait = min(wait, max(d, 0.001))
 			glfw.WaitEventsTimeout(wait)
 		}
 		if time.tick_since(blink_at) >= 500 * time.Millisecond {
@@ -611,6 +644,7 @@ main :: proc() {
 				app.dirty = true
 			}
 			if !pane_pump(app, p) {
+				pane_exited(app, p)
 				remove_pane(app, p)
 				continue
 			}
@@ -618,6 +652,7 @@ main :: proc() {
 			// evictions can hit panes that are not on screen
 			release_textures(&app.r, &p.vt.gfx)
 		}
+		ctl_process(app)
 		if len(app.spaces) == 0 do break
 		if app.dirty && !syncing(app) do render(app)
 		free_all(context.temp_allocator)

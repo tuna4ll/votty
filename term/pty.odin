@@ -74,6 +74,7 @@ pty_spawn :: proc(argv: []string, env: []string, ws: Winsize, notify: proc(data:
 	// build everything the child needs before fork
 	cargv := make([]cstring, len(argv) + 1, context.temp_allocator)
 	for a, i in argv do cargv[i] = strings.clone_to_cstring(a, context.temp_allocator)
+	cargv[0] = strings.clone_to_cstring(find_program(argv[0], env), context.temp_allocator)
 	cenv := make([dynamic]cstring, context.temp_allocator)
 	for e in env do append(&cenv, strings.clone_to_cstring(e, context.temp_allocator))
 	outer: for i := 0; c_environ != nil && c_environ[i] != nil; i += 1 {
@@ -97,6 +98,24 @@ pty_spawn :: proc(argv: []string, env: []string, ws: Winsize, notify: proc(data:
 	p.pid = pid
 	p.reader = thread.create_and_start_with_data(p, reader_loop)
 	return p, true
+}
+
+// resolves a bare program name through PATH, the child's if env sets one
+find_program :: proc(name: string, env: []string) -> string {
+	if strings.contains_rune(name, '/') do return name
+	path := ""
+	for e in env do if strings.has_prefix(e, "PATH=") do path = e[5:]
+	if path == "" {
+		for i := 0; c_environ != nil && c_environ[i] != nil; i += 1 {
+			s := string(c_environ[i])
+			if strings.has_prefix(s, "PATH=") do path = s[5:]
+		}
+	}
+	for dir in strings.split_iterator(&path, ":") {
+		full := strings.concatenate({dir if dir != "" else ".", "/", name}, context.temp_allocator)
+		if linux.access(strings.clone_to_cstring(full, context.temp_allocator), linux.X_OK) == nil do return full
+	}
+	return name
 }
 
 @(private)

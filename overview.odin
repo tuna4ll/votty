@@ -616,7 +616,8 @@ draw_connector :: proc(app: ^App, a, b: ^Workspace, color: u32) -> (lx, ly: f32)
 		push_rect(r, midx - th / 2, min(sy, ey) - th / 2, th, abs(ey - sy) + th, color)
 		push_rect(r, midx, ey - th / 2, ex - midx, th, color)
 		push_rect(r, ex - 5 * th, ey - 3 * th, 5 * th, 6 * th, color)
-		return midx, (sy + ey) / 2
+		// the label rides above the first segment so the line stays visible
+		return (sx + midx) / 2, sy - f32(app.f.cell_h)
 	}
 	// over the top: up from the source, across above every card in between, down into the target
 	sx, sy = ax + aw / 2, ay
@@ -631,7 +632,7 @@ draw_connector :: proc(app: ^App, a, b: ^Workspace, color: u32) -> (lx, ly: f32)
 	push_rect(r, min(sx, ex) - th / 2, top - th / 2, abs(ex - sx) + th, th, color)
 	push_rect(r, ex - th / 2, top, th, ey - top, color)
 	push_rect(r, ex - 3 * th, ey - 5 * th, 6 * th, 5 * th, color)
-	return (sx + ex) / 2, top
+	return (sx + ex) / 2, top - f32(app.f.cell_h) * 0.7
 }
 
 // connectors go under the cards, their labels on top

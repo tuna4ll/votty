@@ -34,6 +34,7 @@ Workspace :: struct {
 	note:      [dynamic]u8, // last notification text
 	exit_code: int,
 	has_exit:  bool,
+	finished:  int, // commands finished in this node
 	duration:  time.Duration,
 }
 
