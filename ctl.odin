@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:c"
 import "core:fmt"
 import "core:os"
+import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
@@ -308,7 +309,8 @@ node_line :: proc(ws: ^Workspace) -> string {
 
 CTL_HELP :: `commands:
   list                                   id, name, status, exit, cwd, note per node
-  new [--name N] [--cwd D] [--bg] [-- CMD...]
+  new [--name N] [--cwd D] [--bg] [--worktree [BRANCH]] [-- CMD...]
+                                         --worktree gives the node its own git worktree
   close ID | rename ID NAME | focus ID | overview
   send ID TEXT [--enter] [--wait]        type into a node; TEXT - reads stdin;
                                          --wait returns when that command finishes
@@ -340,10 +342,19 @@ ctl_handle :: proc(app: ^App, raw: []string) -> (ok: bool, body: string, wait: C
 		name, _ := option(&args, "--name")
 		cwd, _ := option(&args, "--cwd")
 		bg := flag(&args, "--bg")
+		branch, has_branch := option(&args, "--worktree")
+		if strings.has_prefix(branch, "--") do has_branch = false
+		if !has_branch && flag(&args, "--worktree") do has_branch, branch = true, ""
 		cmd: []string
 		for a, i in args do if a == "--" {
 			cmd = args[i + 1:]
 			break
+		}
+		if has_branch {
+			dir, err := make_worktree(cwd if cwd != "" else focused_cwd(app), branch)
+			if err != "" do return false, err, {}
+			cwd = dir
+			if name == "" do name = filepath.base(dir)
 		}
 		ws := new_workspace(app, cwd, cmd, name, !bg)
 		if ws == nil do return false, "cannot start the node", {}

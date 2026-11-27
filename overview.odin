@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:math"
 import "core:os"
+import "core:path/filepath"
 import "core:time"
 import "core:unicode/utf8"
 import "term"
@@ -194,7 +195,7 @@ draw_overview :: proc(app: ^App, w, h: int) {
 	for ws in app.spaces do draw_card(app, ws, w, h)
 	draw_edge_labels(app, labels[:])
 	// key help along the bottom
-	help := "enter open · n new · r rename · p pipe · a after · u unlink · s send · x close · shift+arrows move · esc"
+	help := "enter open · n new · w worktree · r rename · p pipe · a after · u unlink · s send · x close · esc"
 	if ov.renaming do help = "type a command  enter link  esc cancel" if ov.link.to != 0 else "type a name  enter save  esc cancel"
 	if ov.link.active do help = "pick the target with the arrows  enter link  esc cancel"
 	bh := f32(f.cell_h + 6)
@@ -345,6 +346,20 @@ overview_key :: proc(app: ^App, key: i32, m: term.Mods) {
 	case glfw.KEY_N:
 		if ws := new_workspace(app, activate = false); ws != nil {
 			if sel != nil do ws.pos = sel.pos + {420, 0}
+			ov.sel = ws
+		}
+	case glfw.KEY_W:
+		// a new node on its own git worktree of the selected node's repository
+		if sel == nil do return
+		t := sel.tabs[sel.cur]
+		if t == nil || t.focus == nil do return
+		dir, err := make_worktree(term.pty_cwd(t.focus.pane.pty, context.temp_allocator), "")
+		if err != "" {
+			set_note(sel, err)
+			return
+		}
+		if ws := new_workspace(app, dir, nil, filepath.base(dir), false); ws != nil {
+			ws.pos = sel.pos + {0, 380}
 			ov.sel = ws
 		}
 	case glfw.KEY_R:
